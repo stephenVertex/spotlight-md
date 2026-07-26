@@ -11,10 +11,11 @@ import { resolve, dirname, basename, extname, join } from "node:path";
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, deleteHighlight: null, clearHighlights: false, addComment: null, commentText: null, prime: false, files: [] };
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, needsAttention: false, deleteHighlight: null, clearHighlights: false, addComment: null, commentText: null, addReply: null, replyText: null, resolveHighlight: null, unresolveHighlight: null, prime: false, files: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
@@ -24,10 +25,15 @@ function parseArgs(argv) {
     else if (a === "--no-open") opts.open = false;
     else if (a === "--theme" || a === "-t") opts.theme = argv[++i];
     else if (a === "--list-highlights") opts.listHighlights = true;
+    else if (a === "--needs-attention") opts.needsAttention = true;
     else if (a === "--delete-highlight") opts.deleteHighlight = argv[++i];
     else if (a === "--clear-highlights") opts.clearHighlights = true;
     else if (a === "--add-comment") opts.addComment = argv[++i];
     else if (a === "--comment-text") opts.commentText = argv[++i];
+    else if (a === "--add-reply") opts.addReply = argv[++i];
+    else if (a === "--reply-text") opts.replyText = argv[++i];
+    else if (a === "--resolve-highlight") opts.resolveHighlight = argv[++i];
+    else if (a === "--unresolve-highlight") opts.unresolveHighlight = argv[++i];
     else if (a === "--help" || a === "-h") {
       console.log(`mdhtml — markdown → dark HTML with live reload
 
@@ -45,10 +51,15 @@ Options:
   --no-open         Don't open browser automatically
   --theme, -t NAME  Color scheme: github-dark (default) or dracula
   --list-highlights List all highlights for the file
+  --needs-attention List only highlights needing AI action (last msg from human, not resolved)
   --delete-highlight ID  Delete a highlight by its ID
   --clear-highlights Remove all highlights for the file
-  --add-comment ID   Add a comment to a highlight (requires --comment-text)
+  --add-comment ID   Add an AI comment to a highlight (requires --comment-text)
   --comment-text TXT The comment text to add (used with --add-comment)
+  --add-reply ID     Add a human reply to a highlight (requires --reply-text)
+  --reply-text TXT   The reply text to add (used with --add-reply)
+  --resolve-highlight ID    Mark a highlight as resolved
+  --unresolve-highlight ID  Reopen a resolved highlight
   prime              Print instructions for AI agents on how to use this tool
   -h, --help        Show this help`);
       process.exit(0);
@@ -62,23 +73,68 @@ Options:
   return opts;
 }
 
-// ── Highlight storage ──────────────────────────────────────────────────────
-function highlightsFilePath(inputPath) {
-  return inputPath.replace(/\.md$/i, ".highlights.json");
+// ── Highlight storage (SQLite) ─────────────────────────────────────────────
+function dbFilePath(inputPath) {
+  return inputPath.replace(/\.md$/i, ".highlights.db");
+}
+
+function openDb(inputPath) {
+  const dbPath = dbFilePath(inputPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS highlights (
+      id TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      section_id TEXT,
+      section_title TEXT,
+      resolved INTEGER DEFAULT 0,
+      completed INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      highlight_id TEXT NOT NULL,
+      author TEXT NOT NULL,
+      text TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      FOREIGN KEY (highlight_id) REFERENCES highlights(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_highlight ON messages(highlight_id, seq);
+  `);
+  return db;
 }
 
 function loadHighlights(inputPath) {
-  const hlPath = highlightsFilePath(inputPath);
-  if (!existsSync(hlPath)) return [];
+  const db = openDb(inputPath);
   try {
-    return JSON.parse(readFileSync(hlPath, "utf-8"));
-  } catch (e) {
-    return [];
+    const rows = db.prepare(`
+      SELECT id, text, section_id, section_title, resolved, completed, created_at, completed_at
+      FROM highlights ORDER BY created_at
+    `).all();
+    return rows.map((r) => {
+      const msgs = db.prepare(`
+        SELECT id, author, text, created_at FROM messages
+        WHERE highlight_id = ? ORDER BY seq
+      `).all(r.id);
+      return {
+        id: r.id,
+        text: r.text,
+        sectionId: r.section_id,
+        sectionTitle: r.section_title,
+        resolved: !!r.resolved,
+        completed: !!r.completed,
+        createdAt: r.created_at,
+        completedAt: r.completed_at || undefined,
+        messages: msgs.map((m) => ({ id: m.id, author: m.author, text: m.text, createdAt: m.created_at })),
+      };
+    });
+  } finally {
+    db.close();
   }
-}
-
-function saveHighlights(inputPath, highlights) {
-  writeFileSync(highlightsFilePath(inputPath), JSON.stringify(highlights, null, 2) + "\n");
 }
 
 function genHighlightId() {
@@ -86,76 +142,144 @@ function genHighlightId() {
 }
 
 function addHighlight(inputPath, data) {
-  const highlights = loadHighlights(inputPath);
-  const hl = {
-    id: genHighlightId(),
-    text: data.text,
-    sectionId: data.sectionId || null,
-    sectionTitle: data.sectionTitle || null,
-    note: data.note || "",
-    createdAt: new Date().toISOString(),
-  };
-  highlights.push(hl);
-  saveHighlights(inputPath, highlights);
-  return hl;
+  const db = openDb(inputPath);
+  try {
+    const id = genHighlightId();
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO highlights (id, text, section_id, section_title, resolved, completed, created_at)
+      VALUES (?, ?, ?, ?, 0, 0, ?)
+    `).run(id, data.text, data.sectionId || null, data.sectionTitle || null, now);
+    let messages = [];
+    if (data.note) {
+      const msgId = "msg-" + randomBytes(3).toString("hex");
+      db.prepare(`
+        INSERT INTO messages (id, highlight_id, author, text, created_at, seq)
+        VALUES (?, ?, 'human', ?, ?, 0)
+      `).run(msgId, id, data.note, now);
+      messages = [{ id: msgId, author: "human", text: data.note, createdAt: now }];
+    }
+    return { id, text: data.text, sectionId: data.sectionId, sectionTitle: data.sectionTitle, resolved: false, completed: false, createdAt: now, messages };
+  } finally {
+    db.close();
+  }
 }
 
 function setHighlightNote(inputPath, id, note) {
-  const highlights = loadHighlights(inputPath);
-  const hl = highlights.find((h) => h.id === id);
-  if (!hl) return null;
-  hl.note = note;
-  saveHighlights(inputPath, highlights);
-  return hl;
+  const db = openDb(inputPath);
+  try {
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
+    if (!existing) return null;
+    const humanMsg = db.prepare("SELECT id FROM messages WHERE highlight_id = ? AND author = 'human' ORDER BY seq LIMIT 1").get(id);
+    if (humanMsg) {
+      db.prepare("UPDATE messages SET text = ? WHERE id = ?").run(note, humanMsg.id);
+    } else {
+      const seq = db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 as next FROM messages WHERE highlight_id = ?").get(id);
+      const msgId = "msg-" + randomBytes(3).toString("hex");
+      db.prepare("INSERT INTO messages (id, highlight_id, author, text, created_at, seq) VALUES (?, ?, 'human', ?, ?, ?)").run(msgId, id, note, new Date().toISOString(), seq.next);
+    }
+    return loadHighlights(inputPath).find((h) => h.id === id) || null;
+  } finally {
+    db.close();
+  }
 }
 
-function addHighlightComment(inputPath, id, text) {
-  const highlights = loadHighlights(inputPath);
-  const hl = highlights.find((h) => h.id === id);
-  if (!hl) return null;
-  if (!hl.comments) hl.comments = [];
-  const comment = {
-    id: "cmt-" + randomBytes(3).toString("hex"),
-    text: text,
-    createdAt: new Date().toISOString(),
-  };
-  hl.comments.push(comment);
-  saveHighlights(inputPath, highlights);
-  return { highlight: hl, comment };
+function addHighlightMessage(inputPath, id, author, text) {
+  const db = openDb(inputPath);
+  try {
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
+    if (!existing) return null;
+    const seq = db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 as next FROM messages WHERE highlight_id = ?").get(id);
+    const msgId = "msg-" + randomBytes(3).toString("hex");
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO messages (id, highlight_id, author, text, created_at, seq) VALUES (?, ?, ?, ?, ?, ?)").run(msgId, id, author, text, now, seq.next);
+    const msg = { id: msgId, author, text, createdAt: now };
+    const hl = loadHighlights(inputPath).find((h) => h.id === id);
+    return { highlight: hl, message: msg };
+  } finally {
+    db.close();
+  }
+}
+
+function setHighlightResolved(inputPath, id, resolved) {
+  const db = openDb(inputPath);
+  try {
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
+    if (!existing) return null;
+    db.prepare("UPDATE highlights SET resolved = ? WHERE id = ?").run(resolved ? 1 : 0, id);
+    return loadHighlights(inputPath).find((h) => h.id === id) || null;
+  } finally {
+    db.close();
+  }
 }
 
 function removeHighlight(inputPath, id) {
-  const highlights = loadHighlights(inputPath);
-  const idx = highlights.findIndex((h) => h.id === id);
-  if (idx === -1) return false;
-  highlights.splice(idx, 1);
-  saveHighlights(inputPath, highlights);
-  return true;
+  const db = openDb(inputPath);
+  try {
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
+    if (!existing) return false;
+    const now = new Date().toISOString();
+    db.prepare("UPDATE highlights SET completed = 1, resolved = 1, completed_at = ? WHERE id = ?").run(now, id);
+    return true;
+  } finally {
+    db.close();
+  }
 }
 
-function printHighlights(inputPath) {
-  const highlights = loadHighlights(inputPath);
+function clearAllHighlights(inputPath) {
+  const db = openDb(inputPath);
+  try {
+    const now = new Date().toISOString();
+    db.prepare("UPDATE highlights SET completed = 1, resolved = 1, completed_at = ? WHERE completed = 0").run(now);
+    return true;
+  } finally {
+    db.close();
+  }
+}
+
+function lastMessageAuthor(hl) {
+  if (!hl.messages || hl.messages.length === 0) return null;
+  return hl.messages[hl.messages.length - 1].author;
+}
+
+function printHighlights(inputPath, filter) {
+  let highlights = loadHighlights(inputPath);
   const fname = basename(inputPath);
+
+  if (filter === "needs-attention") {
+    highlights = highlights.filter((h) => !h.completed && !h.resolved && lastMessageAuthor(h) === "human");
+  }
+
   if (highlights.length === 0) {
-    console.log(`  No highlights for ${fname}`);
+    const label = filter === "needs-attention" ? "needing attention" : "";
+    console.log(`  No highlights ${label} for ${fname}`);
     return;
   }
-  console.log(`  Highlights for ${fname} (${highlights.length} total):\n`);
+
+  const open = highlights.filter((h) => !h.resolved && !h.completed).length;
+  const resolved = highlights.filter((h) => h.resolved && !h.completed).length;
+  const completed = highlights.filter((h) => h.completed).length;
+  const summary = `${highlights.length} total, ${open} open, ${resolved} resolved, ${completed} completed`;
+  console.log(`  Highlights for ${fname} (${summary}):\n`);
+
   for (const h of highlights) {
     const section = h.sectionId ? `§${h.sectionId}` : "§(top)";
     const preview = h.text.length > 80 ? h.text.slice(0, 77) + "…" : h.text;
-    console.log(`  ${h.id}  ${section}`);
+    let status = "";
+    if (h.completed) status = " [COMPLETED]";
+    else if (h.resolved) status = " [RESOLVED]";
+    console.log(`  ${h.id}  ${section}${status}`);
     console.log(`    "${preview}"`);
-    if (h.note) {
-      console.log(`    note: "${h.note}"`);
-    }
-    if (h.comments && h.comments.length > 0) {
-      for (const c of h.comments) {
-        const cprev = c.text.length > 80 ? c.text.slice(0, 77) + "…" : c.text;
-        console.log(`    comment [${c.id}]: "${cprev}"`);
+    if (h.messages && h.messages.length > 0) {
+      for (const m of h.messages) {
+        const label = m.author === "human" ? "YOU" : "AI";
+        const mprev = m.text.length > 80 ? m.text.slice(0, 77) + "…" : m.text;
+        console.log(`    [${label}] ${mprev}`);
       }
     }
-    console.log(`    created: ${h.createdAt}\n`);
+    console.log(`    created: ${h.createdAt}`);
+    if (h.completedAt) console.log(`    completed: ${h.completedAt}`);
+    console.log();
   }
 }
 
@@ -1374,10 +1498,10 @@ function serveAuto(inputPath, opts) {
       return;
     }
 
-    // Comment endpoint: POST /__highlights__/:id/comments
-    const cmtMatch = req.url.match(/^\/__highlights__\/(.+)\/comments$/);
-    if (cmtMatch && req.method === "POST") {
-      const id = cmtMatch[1];
+    // Message endpoint: POST /__highlights__/:id/messages  (author defaults to "ai")
+    const msgMatch = req.url.match(/^\/__highlights__\/(.+)\/messages$/);
+    if (msgMatch && req.method === "POST") {
+      const id = msgMatch[1];
       readBody(req).then((body) => {
         try {
           const data = JSON.parse(body);
@@ -1386,7 +1510,8 @@ function serveAuto(inputPath, opts) {
             res.end(JSON.stringify({ error: "text required" }));
             return;
           }
-          const result = addHighlightComment(inputPath, id, data.text.trim());
+          const author = data.author || "ai";
+          const result = addHighlightMessage(inputPath, id, author, data.text.trim());
           if (result) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(result));
@@ -1400,6 +1525,38 @@ function serveAuto(inputPath, opts) {
           res.end(JSON.stringify({ error: e.message }));
         }
       });
+      return;
+    }
+
+    // Resolve endpoint: PATCH /__highlights__/:id/resolve
+    const resolveMatch = req.url.match(/^\/__highlights__\/(.+)\/resolve$/);
+    if (resolveMatch && req.method === "PATCH") {
+      const id = resolveMatch[1];
+      const hl = setHighlightResolved(inputPath, id, true);
+      if (hl) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(hl));
+        broadcastHighlights();
+      } else {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+      }
+      return;
+    }
+
+    // Unresolve endpoint: PATCH /__highlights__/:id/unresolve
+    const unresolveMatch = req.url.match(/^\/__highlights__\/(.+)\/unresolve$/);
+    if (unresolveMatch && req.method === "PATCH") {
+      const id = unresolveMatch[1];
+      const hl = setHighlightResolved(inputPath, id, false);
+      if (hl) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(hl));
+        broadcastHighlights();
+      } else {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+      }
       return;
     }
 
@@ -1525,9 +1682,9 @@ the browser reloads automatically.
 
 ## Sidecar storage
 
-Highlights are stored in:  <filename>.highlights.json
+Highlights are stored in:  <filename>.highlights.db (SQLite, WAL mode)
 This file is managed by spotlight-md. Do not edit it by hand. Do not
-commit it to version control (add *.highlights.json to .gitignore).
+commit it to version control (add *.highlights.db to .gitignore).
 
 ## Workflow rules
 
@@ -1571,9 +1728,14 @@ if (opts.listHighlights) {
   process.exit(0);
 }
 
+if (opts.needsAttention) {
+  printHighlights(inputPath, "needs-attention");
+  process.exit(0);
+}
+
 if (opts.clearHighlights) {
-  saveHighlights(inputPath, []);
-  console.log(`  cleared all highlights for ${basename(inputPath)}`);
+  clearAllHighlights(inputPath);
+  console.log(`  marked all highlights as completed for ${basename(inputPath)}`);
   process.exit(0);
 }
 
@@ -1593,11 +1755,48 @@ if (opts.addComment) {
     console.error("  --add-comment requires --comment-text");
     process.exit(1);
   }
-  const result = addHighlightComment(inputPath, opts.addComment, opts.commentText);
+  const result = addHighlightMessage(inputPath, opts.addComment, "ai", opts.commentText);
   if (result) {
-    console.log(`  added comment ${result.comment.id} to ${opts.addComment}`);
+    console.log(`  added AI comment to ${opts.addComment}`);
   } else {
     console.error(`  highlight ${opts.addComment} not found`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+if (opts.addReply) {
+  if (!opts.replyText) {
+    console.error("  --add-reply requires --reply-text");
+    process.exit(1);
+  }
+  const result = addHighlightMessage(inputPath, opts.addReply, "human", opts.replyText);
+  if (result) {
+    console.log(`  added reply to ${opts.addReply}`);
+  } else {
+    console.error(`  highlight ${opts.addReply} not found`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+if (opts.resolveHighlight) {
+  const hl = setHighlightResolved(inputPath, opts.resolveHighlight, true);
+  if (hl) {
+    console.log(`  resolved ${opts.resolveHighlight}`);
+  } else {
+    console.error(`  highlight ${opts.resolveHighlight} not found`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+if (opts.unresolveHighlight) {
+  const hl = setHighlightResolved(inputPath, opts.unresolveHighlight, false);
+  if (hl) {
+    console.log(`  reopened ${opts.unresolveHighlight}`);
+  } else {
+    console.error(`  highlight ${opts.unresolveHighlight} not found`);
     process.exit(1);
   }
   process.exit(0);
