@@ -1,0 +1,1439 @@
+#!/usr/bin/env node
+// mdhtml — render markdown to a dark-themed HTML page with optional live reload.
+//   mdhtml file.md              → writes file.html
+//   mdhtml --auto file.md       → serves + watches + live-reloads in browser
+//   mdhtml -o out.html file.md  → specify output path
+//   mdhtml --port 4040 --auto file.md
+// Zero dependencies. Node 18+.
+
+import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, existsSync } from "node:fs";
+import { resolve, dirname, basename, extname, join } from "node:path";
+import { createServer } from "node:http";
+import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+
+// ── CLI parsing ────────────────────────────────────────────────────────────
+function parseArgs(argv) {
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, deleteHighlight: null, clearHighlights: false, files: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--auto" || a === "-a") opts.auto = true;
+    else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
+    else if (a === "--output" || a === "-o") opts.output = argv[++i];
+    else if (a === "--no-open") opts.open = false;
+    else if (a === "--theme" || a === "-t") opts.theme = argv[++i];
+    else if (a === "--list-highlights") opts.listHighlights = true;
+    else if (a === "--delete-highlight") opts.deleteHighlight = argv[++i];
+    else if (a === "--clear-highlights") opts.clearHighlights = true;
+    else if (a === "--help" || a === "-h") {
+      console.log(`mdhtml — markdown → dark HTML with live reload
+
+Usage:
+  mdhtml file.md                Write file.html
+  mdhtml --auto file.md         Serve, watch, and live-reload in browser
+  mdhtml -o out.html file.md    Specify output path
+  mdhtml --port 4040 --auto file.md
+  mdhtml --no-open --auto file.md   Don't auto-open browser
+
+Options:
+  --auto, -a        Start local server + watch for live reload
+  --port, -p NUM    Server port (default 7231)
+  --output, -o PATH Output file path (default: <input>.html)
+  --no-open         Don't open browser automatically
+  --theme, -t NAME  Color scheme: github-dark (default) or dracula
+  --list-highlights List all highlights for the file
+  --delete-highlight ID  Delete a highlight by its ID
+  --clear-highlights Remove all highlights for the file
+  -h, --help        Show this help`);
+      process.exit(0);
+    } else if (a.startsWith("-")) {
+      console.error(`Unknown option: ${a}`);
+      process.exit(1);
+    } else {
+      opts.files.push(a);
+    }
+  }
+  return opts;
+}
+
+// ── Highlight storage ──────────────────────────────────────────────────────
+function highlightsFilePath(inputPath) {
+  return inputPath.replace(/\.md$/i, ".highlights.json");
+}
+
+function loadHighlights(inputPath) {
+  const hlPath = highlightsFilePath(inputPath);
+  if (!existsSync(hlPath)) return [];
+  try {
+    return JSON.parse(readFileSync(hlPath, "utf-8"));
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveHighlights(inputPath, highlights) {
+  writeFileSync(highlightsFilePath(inputPath), JSON.stringify(highlights, null, 2) + "\n");
+}
+
+function genHighlightId() {
+  return "hl-" + randomBytes(3).toString("hex");
+}
+
+function addHighlight(inputPath, data) {
+  const highlights = loadHighlights(inputPath);
+  const hl = {
+    id: genHighlightId(),
+    text: data.text,
+    sectionId: data.sectionId || null,
+    sectionTitle: data.sectionTitle || null,
+    createdAt: new Date().toISOString(),
+  };
+  highlights.push(hl);
+  saveHighlights(inputPath, highlights);
+  return hl;
+}
+
+function removeHighlight(inputPath, id) {
+  const highlights = loadHighlights(inputPath);
+  const idx = highlights.findIndex((h) => h.id === id);
+  if (idx === -1) return false;
+  highlights.splice(idx, 1);
+  saveHighlights(inputPath, highlights);
+  return true;
+}
+
+function printHighlights(inputPath) {
+  const highlights = loadHighlights(inputPath);
+  const fname = basename(inputPath);
+  if (highlights.length === 0) {
+    console.log(`  No highlights for ${fname}`);
+    return;
+  }
+  console.log(`  Highlights for ${fname} (${highlights.length} total):\n`);
+  for (const h of highlights) {
+    const section = h.sectionId ? `§${h.sectionId}` : "§(top)";
+    const preview = h.text.length > 80 ? h.text.slice(0, 77) + "…" : h.text;
+    console.log(`  ${h.id}  ${section}`);
+    console.log(`    "${preview}"`);
+    console.log(`    created: ${h.createdAt}\n`);
+  }
+}
+
+// ── Markdown → HTML ────────────────────────────────────────────────────────
+function escapeHtml(s) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderInline(text) {
+  // Extract code spans first to protect them
+  const codeSpans = [];
+  text = text.replace(/`([^`]+)`/g, (_, code) => {
+    codeSpans.push(code);
+    return `\x00CODE${codeSpans.length - 1}\x00`;
+  });
+
+  // Escape remaining HTML
+  text = escapeHtml(text);
+
+  // Bold+italic ***...***
+  text = text.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  // Bold **...** or __...__
+  text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  // Italic *...* or _..._
+  text = text.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
+  text = text.replace(/(?<!_)_([^_\n]+)_(?!_)/g, "<em>$1</em>");
+  // Links [text](url)
+  text = text.replace(
+    /\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
+    (_, label, url, title) =>
+      `<a href="${url}"${title ? ` title="${title}"` : ""}>${label}</a>`
+  );
+  // Strikethrough ~~...~~
+  text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+
+  // Restore code spans
+  text = text.replace(/\x00CODE(\d+)\x00/g, (_, i) => {
+    return `<code>${escapeHtml(codeSpans[parseInt(i, 10)])}</code>`;
+  });
+
+  return text;
+}
+
+function renderMarkdown(md) {
+  const lines = md.replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Blank line
+    if (line.trim() === "") {
+      i++;
+      continue;
+    }
+
+    // Fenced code block
+    if (/^```/.test(line.trim())) {
+      const lang = line.trim().slice(3).trim();
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing ```
+      out.push(
+        `<pre><code class="language-${lang || "plaintext"}">${escapeHtml(
+          codeLines.join("\n")
+        )}</code></pre>`
+      );
+      continue;
+    }
+
+    // Heading
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const text = headingMatch[2].replace(/#+\s*$/, "").trim();
+      const id = text
+        .toLowerCase()
+        .replace(/[^\w\s-]/g, "")
+        .replace(/\s+/g, "-");
+      out.push(
+        `<h${level} id="${id}">${renderInline(text)}</h${level}>`
+      );
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^(\s*[-*_]){3,}\s*$/.test(line)) {
+      out.push("<hr>");
+      i++;
+      continue;
+    }
+
+    // Blockquote
+    if (/^>\s?/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^>\s?/, ""));
+        i++;
+      }
+      out.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
+      continue;
+    }
+
+    // Table (pipe table)
+    if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|[-:\s|]+\|/.test(lines[i + 1])) {
+      const tableLines = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) {
+        tableLines.push(lines[i]);
+        i++;
+      }
+      const header = tableLines[0]
+        .trim()
+        .slice(1, -1)
+        .split("|")
+        .map((c) => c.trim());
+      const rows = tableLines.slice(2).map((r) =>
+        r
+          .trim()
+          .slice(1, -1)
+          .split("|")
+          .map((c) => c.trim())
+      );
+      let html = "<table><thead><tr>";
+      for (const h of header) html += `<th>${renderInline(h)}</th>`;
+      html += "</tr></thead><tbody>";
+      for (const row of rows) {
+        html += "<tr>";
+        for (const cell of row) html += `<td>${renderInline(cell)}</td>`;
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+      out.push(html);
+      continue;
+    }
+
+    // Unordered list
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && (/^\s*[-*+]\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length > 0))) {
+        if (/^\s*[-*+]\s+/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*[-*+]\s+/, ""));
+          i++;
+        } else {
+          // continuation line
+          items[items.length - 1] += "\n" + lines[i].replace(/^\s{2,}/, "");
+          i++;
+        }
+      }
+      out.push(
+        "<ul>" +
+          items.map((item) => `<li>${renderInline(item.replace(/\n/g, "<br>"))}</li>`).join("") +
+          "</ul>"
+      );
+      continue;
+    }
+
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && (/^\s*\d+\.\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length > 0))) {
+        if (/^\s*\d+\.\s+/.test(lines[i])) {
+          items.push(lines[i].replace(/^\s*\d+\.\s+/, ""));
+          i++;
+        } else {
+          items[items.length - 1] += "\n" + lines[i].replace(/^\s{2,}/, "");
+          i++;
+        }
+      }
+      out.push(
+        "<ol>" +
+          items.map((item) => `<li>${renderInline(item.replace(/\n/g, "<br>"))}</li>`).join("") +
+          "</ol>"
+      );
+      continue;
+    }
+
+    // Paragraph (collect until blank line or block element)
+    const paraLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^```/.test(lines[i].trim()) &&
+      !/^#{1,6}\s+/.test(lines[i]) &&
+      !/^(\s*[-*_]){3,}\s*$/.test(lines[i]) &&
+      !/^>\s?/.test(lines[i]) &&
+      !/^\s*[-*+]\s+/.test(lines[i]) &&
+      !/^\s*\d+\.\s+/.test(lines[i]) &&
+      !/^\s*\|/.test(lines[i])
+    ) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    if (paraLines.length > 0) {
+      out.push(`<p>${renderInline(paraLines.join(" "))}</p>`);
+    }
+  }
+
+  return out.join("\n");
+}
+
+// ── TOC extraction ─────────────────────────────────────────────────────────
+function extractToc(html) {
+  const re = /<h([123])\s+id="([^"]+)"[^>]*>(.*?)<\/h\1>/gi;
+  const entries = [];
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    entries.push({
+      level: parseInt(m[1]),
+      id: m[2],
+      text: m[3].replace(/<[^>]+>/g, ""),
+    });
+  }
+  return entries;
+}
+
+function buildTocHtml(entries) {
+  if (entries.length === 0) return "";
+  const minLevel = Math.min(...entries.map((e) => e.level));
+  let html = "";
+  for (const e of entries) {
+    const indent = (e.level - minLevel) * 16;
+    html += `<a href="#${e.id}" class="toc-link toc-l${e.level}" data-target="${e.id}" style="padding-left:${12 + indent}px"><span>${escapeHtml(e.text)}</span></a>\n`;
+  }
+  return html;
+}
+
+// ── Frontmatter extraction ─────────────────────────────────────────────────
+function extractFrontmatter(rawMd) {
+  const lines = rawMd.split("\n");
+  let h1Idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#\s+/.test(lines[i])) { h1Idx = i; break; }
+  }
+  if (h1Idx === -1) return { frontmatter: null, md: rawMd };
+
+  // Collect non-blank lines after H1 until a blank line
+  const blockStart = h1Idx + 1;
+  // skip blank lines between H1 and content
+  let idx = blockStart;
+  while (idx < lines.length && lines[idx].trim() === "") idx++;
+  const blockLines = [];
+  while (idx < lines.length && lines[idx].trim() !== "") {
+    blockLines.push(lines[idx]);
+    idx++;
+  }
+
+  // Check if this block is frontmatter (multiple **Label:** entries)
+  const labelRe = /^\*\*([^*]+):\*\*\s*(.*)$/;
+  const matched = blockLines.filter((l) => labelRe.test(l)).length;
+  if (matched < 2) return { frontmatter: null, md: rawMd };
+
+  // Group lines into fields
+  const fields = [];
+  let current = null;
+  for (const line of blockLines) {
+    const m = line.match(labelRe);
+    if (m) {
+      if (current) fields.push(current);
+      current = { label: m[1], value: m[2] };
+    } else if (current) {
+      current.value += " " + line.trim();
+    }
+  }
+  if (current) fields.push(current);
+
+  // Remove the frontmatter block from the markdown
+  // Keep the H1 and everything after the blank line that ends the block
+  const before = lines.slice(0, blockStart).join("\n");
+  const after = lines.slice(idx).join("\n");
+  const cleanedMd = before + "\n" + after;
+
+  return { frontmatter: fields, md: cleanedMd };
+}
+
+function buildFrontmatterHtml(fields) {
+  if (!fields || fields.length === 0) return "";
+  let html = '<div class="frontmatter">\n';
+  for (const f of fields) {
+    html += `  <div class="fm-field"><span class="fm-label">${escapeHtml(f.label)}</span><span class="fm-value">${renderInlinePandoc(f.value)}</span></div>\n`;
+  }
+  html += "</div>";
+  return html;
+}
+
+// Render a single inline string through pandoc for correctness
+function renderInlinePandoc(text) {
+  const result = spawnSync("pandoc", [
+    "--from", "markdown+autolink_bare_uris",
+    "--to", "html5",
+    "--no-highlight",
+  ], { input: text, encoding: "utf-8" });
+  let out = result.stdout ? result.stdout.trim() : escapeHtml(text);
+  // Strip wrapping <p> tags since this is inline content
+  out = out.replace(/^<p>([\s\S]*)<\/p>$/, "$1");
+  return out;
+}
+
+// ── Themes ─────────────────────────────────────────────────────────────────
+const THEMES = {
+  "github-dark": {
+    "--bg": "#0d1117",
+    "--bg-secondary": "#161b22",
+    "--bg-tertiary": "#1c2128",
+    "--border": "#30363d",
+    "--text": "#c9d1d9",
+    "--text-muted": "#8b949e",
+    "--heading": "#f0f6fc",
+    "--link": "#58a6ff",
+    "--code-bg": "#161b22",
+    "--code-text": "#f0883e",
+    "--quote-border": "#3b434b",
+    "--quote-text": "#8b949e",
+    "--accent": "#f78166",
+    "--accent-dim": "rgba(247,129,102,0.15)",
+    "--table-header-bg": "#1c2128",
+    "--table-row-alt": "#161b22",
+    "--sidebar-bg": "#161b22",
+  },
+  dracula: {
+    "--bg": "#282a36",
+    "--bg-secondary": "#21222c",
+    "--bg-tertiary": "#44475a",
+    "--border": "#44475a",
+    "--text": "#f8f8f2",
+    "--text-muted": "#6272a4",
+    "--heading": "#f8f8f2",
+    "--link": "#ff79c6",
+    "--code-bg": "#21222c",
+    "--code-text": "#50fa7b",
+    "--quote-border": "#bd93f9",
+    "--quote-text": "#6272a4",
+    "--accent": "#bd93f9",
+    "--accent-dim": "rgba(189,147,249,0.15)",
+    "--table-header-bg": "#44475a",
+    "--table-row-alt": "#21222c",
+    "--sidebar-bg": "#21222c",
+  },
+};
+
+function themeRoot(themeName) {
+  const t = THEMES[themeName] || THEMES["github-dark"];
+  const vars = Object.entries(t)
+    .map(([k, v]) => `  ${k}: ${v};`)
+    .join("\n");
+  return `:root {\n${vars}\n  --sidebar-w: 300px;\n}`;
+}
+
+// ── HTML template ──────────────────────────────────────────────────────────
+const CSS = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+/* Layout */
+.layout {
+  display: flex;
+  align-items: flex-start;
+}
+.sidebar {
+  position: sticky;
+  top: 0;
+  width: var(--sidebar-w);
+  height: 100vh;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  flex-shrink: 0;
+  padding: 24px 0 48px;
+}
+.sidebar-header {
+  padding: 0 20px 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.sidebar-header .doc-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--heading);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.toc {
+  padding: 0 8px;
+}
+.toc-link {
+  display: block;
+  padding: 5px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+  line-height: 1.4;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toc-link span {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+.toc-link:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.04);
+  text-decoration: none;
+}
+.toc-link.active {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+  font-weight: 500;
+}
+.toc-l1 { font-weight: 600; color: var(--heading); }
+.toc-l2 { }
+.toc-l3 { font-size: 12px; }
+.content {
+  flex: 1;
+  min-width: 0;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 48px 48px 120px;
+}
+/* Frontmatter card */
+.frontmatter {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  margin-bottom: 32px;
+}
+.fm-field {
+  display: flex;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.fm-field:last-child { border-bottom: none; }
+.fm-label {
+  flex-shrink: 0;
+  width: 160px;
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 13px;
+  padding-top: 1px;
+}
+.fm-value {
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+}
+.fm-value code { font-size: 0.85em; }
+.fm-value a { color: var(--link); }
+/* Headings */
+h1, h2, h3, h4, h5, h6 {
+  color: var(--heading);
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 1.8em;
+  margin-bottom: 0.6em;
+  scroll-margin-top: 20px;
+}
+h1 { font-size: 2em; margin-top: 0; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+h2 { font-size: 1.5em; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1em; }
+h5, h6 { font-size: 0.9em; color: var(--text-muted); }
+p { margin-bottom: 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: var(--heading); font-weight: 600; }
+em { font-style: italic; }
+del { color: var(--text-muted); }
+ul, ol { margin-bottom: 1em; padding-left: 1.7em; }
+li { margin-bottom: 0.3em; }
+li > ul, li > ol { margin-top: 0.3em; margin-bottom: 0; }
+code {
+  font-family: "SF Mono", "Monaco", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+  font-size: 0.88em;
+  background: var(--code-bg);
+  color: var(--code-text);
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  overflow-x: auto;
+  margin-bottom: 1.2em;
+  line-height: 1.5;
+}
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font-size: 0.85em;
+}
+blockquote {
+  border-left: 4px solid var(--quote-border);
+  padding: 0.5em 1.2em;
+  margin: 0 0 1.2em 0;
+  color: var(--quote-text);
+}
+blockquote p { margin-bottom: 0; }
+blockquote * { color: var(--quote-text); }
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 1.2em;
+  font-size: 0.92em;
+}
+th, td {
+  border: 1px solid var(--border);
+  padding: 8px 13px;
+  text-align: left;
+}
+th {
+  background: var(--table-header-bg);
+  color: var(--heading);
+  font-weight: 600;
+}
+tr:nth-child(even) td { background: var(--table-row-alt); }
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
+.sidebar::-webkit-scrollbar { width: 6px; }
+.sidebar::-webkit-scrollbar-thumb { background: #30363d; }
+/* Reload indicator */
+#reload-badge {
+  position: fixed; top: 16px; right: 16px;
+  background: var(--accent); color: #fff;
+  padding: 6px 14px; border-radius: 20px;
+  font-size: 13px; font-weight: 600;
+  opacity: 0; transition: opacity 0.3s;
+  pointer-events: none; z-index: 9999;
+}
+#reload-badge.show { opacity: 1; }
+/* Highlights */
+mark.mdhtml-hl {
+  background: var(--accent-dim);
+  color: inherit;
+  border-bottom: 2px solid var(--accent);
+  padding: 1px 2px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+mark.mdhtml-hl:hover {
+  background: rgba(247,129,102,0.25);
+}
+.hl-popup {
+  position: fixed;
+  z-index: 10000;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  user-select: none;
+  transition: background 0.15s, border-color 0.15s;
+}
+.hl-popup:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.hl-delete-popup {
+  position: fixed;
+  z-index: 10000;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.hl-delete-popup .hl-id {
+  font-family: "SF Mono", Monaco, monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.hl-delete-popup .hl-del-btn {
+  background: rgba(247,81,73,0.15);
+  color: #f85149;
+  border: 1px solid rgba(247,81,73,0.3);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.hl-delete-popup .hl-del-btn:hover {
+  background: rgba(247,81,73,0.25);
+}
+/* Highlights panel (right side) */
+.hl-panel {
+  position: sticky;
+  top: 0;
+  width: 260px;
+  height: 100vh;
+  background: var(--sidebar-bg);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  flex-shrink: 0;
+  padding: 24px 0 48px;
+}
+.hl-panel-header {
+  padding: 0 20px 14px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--heading);
+}
+.hl-panel-count {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 12px;
+}
+.hl-panel-empty {
+  padding: 0 20px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.hl-card {
+  margin: 0 10px 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.hl-card:hover {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+.hl-card-text {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+  margin-bottom: 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.hl-card-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.hl-card-id {
+  font-family: "SF Mono", Monaco, monospace;
+  font-size: 10px;
+}
+.hl-card-section {
+  color: var(--accent);
+  font-weight: 500;
+}
+.hl-panel::-webkit-scrollbar { width: 6px; }
+.hl-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+/* Mobile */
+@media (max-width: 1100px) {
+  .hl-panel { display: none; }
+}
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .content { padding: 32px 20px 80px; }
+}
+`;
+
+function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName) {
+  const reloadScript = autoMode
+    ? `<div id="reload-badge">Reloading…</div>
+<script>
+(function(){
+  var badge = document.getElementById('reload-badge');
+  function showBadge(){ badge.classList.add('show'); }
+  try {
+    var es = new EventSource('/__reload__');
+    es.addEventListener('reload', function(){
+      showBadge();
+      setTimeout(function(){ location.reload(); }, 200);
+    });
+  } catch(e){
+    setInterval(function(){
+      fetch('/__mtime__').then(r=>r.text()).then(function(t){
+        if(window._mtime && t !== window._mtime){ showBadge(); setTimeout(function(){ location.reload(); }, 200); }
+        window._mtime = t;
+      }).catch(function(){});
+    }, 1500);
+    fetch('/__mtime__').then(r=>r.text()).then(function(t){ window._mtime = t; });
+  }
+})();
+</script>`
+    : "";
+
+  const scrollSpy = tocHtml ? `
+<script>
+(function(){
+  var links = document.querySelectorAll('.toc-link');
+  var headings = [];
+  links.forEach(function(link){
+    var h = document.getElementById(link.dataset.target);
+    if (h) headings.push({ el: h, link: link });
+  });
+  if (headings.length === 0) return;
+  var activeLink = null;
+  function onScroll() {
+    var scrollY = window.scrollY + 80;
+    var current = null;
+    for (var i = 0; i < headings.length; i++) {
+      if (headings[i].el.offsetTop <= scrollY) {
+        current = headings[i];
+      } else { break; }
+    }
+    if (current && current.link !== activeLink) {
+      if (activeLink) activeLink.classList.remove('active');
+      current.link.classList.add('active');
+      activeLink = current.link;
+      // Scroll the sidebar to keep the active item visible
+      var sidebar = document.querySelector('.sidebar');
+      var linkTop = current.link.offsetTop;
+      var linkBottom = linkTop + current.link.offsetHeight;
+      var viewTop = sidebar.scrollTop;
+      var viewBottom = viewTop + sidebar.clientHeight;
+      if (linkTop < viewTop + 60) sidebar.scrollTop = linkTop - 60;
+      else if (linkBottom > viewBottom - 60) sidebar.scrollTop = linkBottom - sidebar.clientHeight + 60;
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+})();
+</script>` : "";
+
+  const highlightScript = autoMode ? `
+<script>
+(function(){
+  var content = document.querySelector('.content');
+  if (!content) return;
+  var selPopup = null;
+  var delPopup = null;
+
+  // -- Apply a single highlight to the DOM --
+  function applyHighlight(hl) {
+    var walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        var p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (p.tagName === 'MARK' && p.classList.contains('mdhtml-hl')) return NodeFilter.FILTER_REJECT;
+        if (p.closest('pre, .sidebar, .frontmatter, .fm-field, .hl-popup, .hl-delete-popup')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    }, false);
+    var textNodes = [];
+    var node;
+    while (node = walker.nextNode()) textNodes.push(node);
+    var fullText = '';
+    var nodeMap = [];
+    for (var i = 0; i < textNodes.length; i++) {
+      nodeMap.push({node: textNodes[i], start: fullText.length, end: fullText.length + textNodes[i].textContent.length});
+      fullText += textNodes[i].textContent;
+    }
+    var idx = fullText.indexOf(hl.text);
+    if (idx === -1) return false;
+    var endIdx = idx + hl.text.length;
+    var startNode = null, startOff = 0, endNode = null, endOff = 0;
+    for (var i = 0; i < nodeMap.length; i++) {
+      if (!startNode && nodeMap[i].start <= idx && nodeMap[i].end >= idx) {
+        startNode = nodeMap[i].node; startOff = idx - nodeMap[i].start;
+      }
+      if (nodeMap[i].start <= endIdx && nodeMap[i].end >= endIdx) {
+        endNode = nodeMap[i].node; endOff = endIdx - nodeMap[i].start; break;
+      }
+    }
+    if (!startNode || !endNode) return false;
+    try {
+      // Wrap each text node segment individually instead of using
+      // extractContents across block boundaries (which creates invalid
+      // HTML and extra spacing). We split text nodes and wrap each
+      // affected portion in its own <mark>.
+      var started = false;
+      for (var i = 0; i < nodeMap.length; i++) {
+        var entry = nodeMap[i];
+        if (entry.node === startNode) started = true;
+        if (!started) continue;
+        var s = (entry.node === startNode) ? startOff : 0;
+        var e = (entry.node === endNode) ? endOff : entry.node.textContent.length;
+        if (entry.node === startNode && entry.node === endNode) { s = startOff; e = endOff; }
+        if (s >= e) { if (entry.node === endNode) break; continue; }
+        var textNode = entry.node;
+        var parent = textNode.parentNode;
+        // Split off the part after the highlight
+        var afterPart = textNode.splitText(e);
+        // splitText on the start offset gives us the highlight portion as textNode
+        var highlightPart = textNode.splitText(s);
+        var mark = document.createElement('mark');
+        mark.className = 'mdhtml-hl';
+        mark.dataset.hlId = hl.id;
+        mark.textContent = highlightPart.textContent;
+        parent.replaceChild(mark, highlightPart);
+        if (entry.node === endNode) break;
+      }
+      return true;
+    } catch(e) { return false; }
+  }
+
+  function clearHighlights() {
+    content.querySelectorAll('mark.mdhtml-hl').forEach(function(m){
+      var parent = m.parentNode;
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+    });
+    content.normalize();
+  }
+
+  function escapeText(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  function renderPanel(hls) {
+    var countEl = document.getElementById('hl-panel-count');
+    var listEl = document.getElementById('hl-panel-list');
+    if (countEl) countEl.textContent = '(' + hls.length + ')';
+    if (!listEl) return;
+    if (hls.length === 0) {
+      listEl.innerHTML = '<div class="hl-panel-empty">Select text in the document to highlight passages.</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < hls.length; i++) {
+      var h = hls[i];
+      var preview = h.text.length > 120 ? h.text.slice(0, 117) + '\\u2026' : h.text;
+      var section = h.sectionTitle ? escapeText(h.sectionTitle) : '(top)';
+      html += '<div class="hl-card" data-hl-id="' + h.id + '">'
+        + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
+        + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span></div>'
+        + '</div>';
+    }
+    listEl.innerHTML = html;
+    listEl.querySelectorAll('.hl-card').forEach(function(card){
+      card.addEventListener('click', function(){
+        var id = card.dataset.hlId;
+        var mark = content.querySelector('mark.mdhtml-hl[data-hl-id="' + id + '"]');
+        if (mark) {
+          mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+    });
+  }
+
+  function loadAndApply() {
+    fetch('/__highlights__').then(function(r){return r.json()}).then(function(hls){
+      clearHighlights();
+      hls.forEach(applyHighlight);
+      renderPanel(hls);
+    }).catch(function(){});
+  }
+
+  // -- Nearest preceding heading --
+  function nearestHeading(sel) {
+    if (sel.rangeCount === 0) return null;
+    var range = sel.getRangeAt(0);
+    var startEl = range.startContainer;
+    if (startEl.nodeType === 3) startEl = startEl.parentElement;
+    var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
+    var nearest = null;
+    for (var i = 0; i < headings.length; i++) {
+      if (headings[i].compareDocumentPosition(startEl) & Node.DOCUMENT_POSITION_FOLLOWING) {
+        nearest = headings[i];
+      } else { break; }
+    }
+    return nearest ? { id: nearest.id, title: nearest.textContent.replace(/<[^>]+>/g,'') } : null;
+  }
+
+  // -- Selection popup --
+  function removeSelPopup() {
+    if (selPopup) { selPopup.remove(); selPopup = null; }
+  }
+
+  function showSelPopup(x, y) {
+    removeSelPopup();
+    selPopup = document.createElement('div');
+    selPopup.className = 'hl-popup';
+    selPopup.textContent = '\\u2726 Highlight';
+    selPopup.style.left = x + 'px';
+    selPopup.style.top = (y - 36) + 'px';
+    selPopup.addEventListener('mousedown', function(e){ e.preventDefault(); });
+    selPopup.addEventListener('click', function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      createHighlightFromSelection();
+      removeSelPopup();
+    });
+    document.body.appendChild(selPopup);
+  }
+
+  function createHighlightFromSelection() {
+    var sel = window.getSelection();
+    if (sel.rangeCount === 0) return;
+    var text = sel.toString().trim();
+    if (!text) return;
+    var heading = nearestHeading(sel);
+    var body = JSON.stringify({
+      text: text,
+      sectionId: heading ? heading.id : null,
+      sectionTitle: heading ? heading.title : null
+    });
+    fetch('/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
+      .then(function(r){return r.json()})
+      .then(function(hl){
+        sel.removeAllRanges();
+        applyHighlight(hl);
+        loadAndApply();
+      })
+      .catch(function(){});
+  }
+
+  // -- Delete popup --
+  function removeDelPopup() {
+    if (delPopup) { delPopup.remove(); delPopup = null; }
+  }
+
+  function showDelPopup(mark, x, y) {
+    removeDelPopup();
+    delPopup = document.createElement('div');
+    delPopup.className = 'hl-delete-popup';
+    var idSpan = document.createElement('span');
+    idSpan.className = 'hl-id';
+    idSpan.textContent = mark.dataset.hlId;
+    var delBtn = document.createElement('span');
+    delBtn.className = 'hl-del-btn';
+    delBtn.textContent = 'Delete';
+    delBtn.addEventListener('click', function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      deleteHighlight(mark.dataset.hlId);
+      removeDelPopup();
+    });
+    delPopup.appendChild(idSpan);
+    delPopup.appendChild(delBtn);
+    delPopup.style.left = x + 'px';
+    delPopup.style.top = (y + 20) + 'px';
+    document.body.appendChild(delPopup);
+  }
+
+  function deleteHighlight(id) {
+    fetch('/__highlights__/' + id, {method:'DELETE'})
+      .then(function(r){return r.json()})
+      .then(function(){
+        loadAndApply();
+      })
+      .catch(function(){});
+  }
+
+  // -- Events --
+  document.addEventListener('mouseup', function(e){
+    if (e.target.closest('.hl-popup, .hl-delete-popup, .sidebar')) return;
+    setTimeout(function(){
+      var sel = window.getSelection();
+      var text = sel.toString().trim();
+      removeSelPopup();
+      removeDelPopup();
+      if (text.length < 2) return;
+      var range = sel.getRangeAt(0);
+      var rect = range.getBoundingClientRect();
+      showSelPopup(rect.left + rect.width/2 - 50, rect.top);
+    }, 10);
+  });
+
+  content.addEventListener('click', function(e){
+    if (e.target.tagName === 'MARK' && e.target.classList.contains('mdhtml-hl')) {
+      e.preventDefault();
+      e.stopPropagation();
+      removeSelPopup();
+      var rect = e.target.getBoundingClientRect();
+      showDelPopup(e.target, rect.left + rect.width/2 - 50, rect.top);
+    } else {
+      removeDelPopup();
+    }
+  });
+
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape') { removeSelPopup(); removeDelPopup(); }
+  });
+
+  // -- SSE: listen for highlight updates --
+  try {
+    var es = new EventSource('/__reload__');
+    es.addEventListener('highlights-updated', function(){
+      loadAndApply();
+    });
+  } catch(e) {}
+
+  // -- Initial load --
+  loadAndApply();
+})();
+</script>` : "";
+
+  const sidebarHtml = tocHtml ? `  <nav class="sidebar">
+    <div class="sidebar-header"><div class="doc-title">${escapeHtml(title)}</div></div>
+    <div class="toc">
+${tocHtml}
+    </div>
+  </nav>` : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(title)}</title>
+<style>${themeRoot(themeName)}\n${CSS}</style>
+</head>
+<body>
+<div class="layout">
+${sidebarHtml}
+  <main class="content">
+${frontmatterHtml ? frontmatterHtml + "\n" : ""}${bodyHtml}
+  </main>
+  <aside class="hl-panel" id="hl-panel">
+    <div class="hl-panel-header">Highlights <span class="hl-panel-count" id="hl-panel-count"></span></div>
+    <div id="hl-panel-list"><div class="hl-panel-empty">Select text in the document to highlight passages.</div></div>
+  </aside>
+</div>
+${reloadScript}
+${scrollSpy}
+${highlightScript}
+</body>
+</html>`;
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+function renderFile(inputPath) {
+  const raw = readFileSync(inputPath, "utf-8");
+
+  // Extract frontmatter (bold-label metadata block after H1)
+  const { frontmatter, md: mdNoFrontmatter } = extractFrontmatter(raw);
+
+  // Strip trailing whitespace per line so paragraphs reflow
+  const reflowed = mdNoFrontmatter
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""))
+    .join("\n");
+
+  const result = spawnSync("pandoc", [
+    "--from", "markdown+autolink_bare_uris",
+    "--to", "html5",
+    "--no-highlight",
+    "--wrap=none",
+  ], { input: reflowed, encoding: "utf-8" });
+
+  if (result.status !== 0) {
+    const err = result.stderr || result.stdout || "unknown pandoc error";
+    throw new Error(`pandoc failed: ${err}`);
+  }
+
+  const body = result.stdout.trim();
+  const title = basename(inputPath, extname(inputPath));
+
+  // Build frontmatter HTML
+  const frontmatterHtml = frontmatter ? buildFrontmatterHtml(frontmatter) : "";
+
+  // Build TOC from rendered headings
+  const tocEntries = extractToc(body);
+  const tocHtml = buildTocHtml(tocEntries);
+
+  return { title, html: body, frontmatterHtml, tocHtml };
+}
+
+function writeStatic(inputPath, outputPath) {
+  const { title, html, frontmatterHtml, tocHtml } = renderFile(inputPath);
+  const full = buildHtml(title, html, frontmatterHtml, tocHtml, false, opts.theme);
+  writeFileSync(outputPath, full);
+  console.log(`  wrote ${outputPath}`);
+}
+
+function serveAuto(inputPath, opts) {
+  let currentHtml = "";
+  let currentTitle = "";
+  let currentFrontmatter = "";
+  let currentToc = "";
+  let mtime = 0;
+  const sseClients = [];
+
+  function rebuild() {
+    try {
+      const { title, html, frontmatterHtml, tocHtml } = renderFile(inputPath);
+      currentTitle = title;
+      currentHtml = html;
+      currentFrontmatter = frontmatterHtml;
+      currentToc = tocHtml;
+      mtime = statSync(inputPath).mtimeMs;
+      console.log(`  [${new Date().toLocaleTimeString()}] rendered ${inputPath}`);
+    } catch (e) {
+      console.error("  render error:", e.message);
+    }
+  }
+
+  rebuild();
+
+  // Also write a static file alongside
+  const outputPath = opts.output || inputPath.replace(/\.md$/i, ".html");
+  function writeStaticCopy() {
+    try {
+      writeFileSync(outputPath, buildHtml(currentTitle, currentHtml, currentFrontmatter, currentToc, false, opts.theme));
+    } catch (e) { /* ignore */ }
+  }
+  writeStaticCopy();
+
+  function broadcastHighlights() {
+    for (const client of sseClients) {
+      client.write("event: highlights-updated\ndata: {}\n\n");
+    }
+  }
+
+  function readBody(req) {
+    return new Promise((resolve) => {
+      let data = "";
+      req.on("data", (chunk) => (data += chunk));
+      req.on("end", () => resolve(data));
+    });
+  }
+
+  const server = createServer((req, res) => {
+    // SSE channel
+    if (req.url === "/__reload__") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      res.write("retry: 2000\n\n");
+      sseClients.push(res);
+      req.on("close", () => {
+        const idx = sseClients.indexOf(res);
+        if (idx !== -1) sseClients.splice(idx, 1);
+      });
+      return;
+    }
+
+    // Highlight REST API
+    if (req.url === "/__highlights__" && req.method === "GET") {
+      const hls = loadHighlights(inputPath);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(hls));
+      return;
+    }
+    if (req.url === "/__highlights__" && req.method === "POST") {
+      readBody(req).then((body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.text || data.text.trim().length < 2) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "text required" }));
+            return;
+          }
+          const hl = addHighlight(inputPath, data);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(hl));
+          broadcastHighlights();
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    const delMatch = req.url.match(/^\/__highlights__\/(.+)$/);
+    if (delMatch && req.method === "DELETE") {
+      const id = delMatch[1];
+      const removed = removeHighlight(inputPath, id);
+      if (removed) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, id }));
+        broadcastHighlights();
+      } else {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+      }
+      return;
+    }
+
+    if (req.url === "/__mtime__") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(String(mtime));
+      return;
+    }
+    // Serve the rendered page
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(buildHtml(currentTitle, currentHtml, currentFrontmatter, currentToc, true, opts.theme));
+  });
+
+  server.listen(opts.port, () => {
+    const url = `http://localhost:${opts.port}`;
+    console.log(`\n  mdhtml serving ${inputPath}`);
+    console.log(`  → ${url}\n`);
+    if (opts.open) {
+      try {
+        spawn("open", [url], { stdio: "ignore", detached: true }).unref();
+      } catch (e) { /* ignore */ }
+    }
+  });
+
+  // Watch the file (polling for reliability on macOS/network drives)
+  let debounceTimer = null;
+  watchFile(inputPath, { interval: 500 }, (curr) => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      rebuild();
+      writeStaticCopy();
+      // Notify all connected browsers
+      for (const client of sseClients) {
+        client.write("event: reload\ndata: {}\n\n");
+      }
+    }, 150);
+  });
+
+  console.log("  watching for changes…  (Ctrl-C to stop)\n");
+
+  process.on("SIGINT", () => {
+    unwatchFile(inputPath);
+    for (const c of sseClients) c.end();
+    server.close();
+    console.log("\n  stopped.");
+    process.exit(0);
+  });
+}
+
+// ── Entry ──────────────────────────────────────────────────────────────────
+const opts = parseArgs(process.argv.slice(2));
+
+if (opts.files.length === 0) {
+  console.error("Usage: mdhtml [--auto] [--port N] [--output PATH] file.md");
+  process.exit(1);
+}
+
+const inputPath = resolve(opts.files[0]);
+
+try {
+  statSync(inputPath);
+} catch (e) {
+  console.error(`File not found: ${inputPath}`);
+  process.exit(1);
+}
+
+// ── Highlight CLI commands ─────────────────────────────────────────────────
+if (opts.listHighlights) {
+  printHighlights(inputPath);
+  process.exit(0);
+}
+
+if (opts.clearHighlights) {
+  saveHighlights(inputPath, []);
+  console.log(`  cleared all highlights for ${basename(inputPath)}`);
+  process.exit(0);
+}
+
+if (opts.deleteHighlight) {
+  const removed = removeHighlight(inputPath, opts.deleteHighlight);
+  if (removed) {
+    console.log(`  deleted ${opts.deleteHighlight} from ${basename(inputPath)}`);
+  } else {
+    console.error(`  highlight ${opts.deleteHighlight} not found`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+// ── Auto / static ──────────────────────────────────────────────────────────
+if (opts.auto) {
+  serveAuto(inputPath, opts);
+} else {
+  const outputPath = resolve(opts.output || inputPath.replace(/\.md$/i, ".html"));
+  writeStatic(inputPath, outputPath);
+}
