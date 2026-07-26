@@ -14,10 +14,11 @@ import { randomBytes } from "node:crypto";
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, deleteHighlight: null, clearHighlights: false, files: [] };
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, deleteHighlight: null, clearHighlights: false, prime: false, files: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--auto" || a === "-a") opts.auto = true;
+    if (a === "prime") opts.prime = true;
+    else if (a === "--auto" || a === "-a") opts.auto = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
     else if (a === "--no-open") opts.open = false;
@@ -44,6 +45,7 @@ Options:
   --list-highlights List all highlights for the file
   --delete-highlight ID  Delete a highlight by its ID
   --clear-highlights Remove all highlights for the file
+  prime              Print instructions for AI agents on how to use this tool
   -h, --help        Show this help`);
       process.exit(0);
     } else if (a.startsWith("-")) {
@@ -86,9 +88,19 @@ function addHighlight(inputPath, data) {
     text: data.text,
     sectionId: data.sectionId || null,
     sectionTitle: data.sectionTitle || null,
+    note: data.note || "",
     createdAt: new Date().toISOString(),
   };
   highlights.push(hl);
+  saveHighlights(inputPath, highlights);
+  return hl;
+}
+
+function setHighlightNote(inputPath, id, note) {
+  const highlights = loadHighlights(inputPath);
+  const hl = highlights.find((h) => h.id === id);
+  if (!hl) return null;
+  hl.note = note;
   saveHighlights(inputPath, highlights);
   return hl;
 }
@@ -115,215 +127,19 @@ function printHighlights(inputPath) {
     const preview = h.text.length > 80 ? h.text.slice(0, 77) + "…" : h.text;
     console.log(`  ${h.id}  ${section}`);
     console.log(`    "${preview}"`);
+    if (h.note) {
+      console.log(`    note: "${h.note}"`);
+    }
     console.log(`    created: ${h.createdAt}\n`);
   }
 }
 
-// ── Markdown → HTML ────────────────────────────────────────────────────────
+// ── Markdown helpers ───────────────────────────────────────────────────────
 function escapeHtml(s) {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-function renderInline(text) {
-  // Extract code spans first to protect them
-  const codeSpans = [];
-  text = text.replace(/`([^`]+)`/g, (_, code) => {
-    codeSpans.push(code);
-    return `\x00CODE${codeSpans.length - 1}\x00`;
-  });
-
-  // Escape remaining HTML
-  text = escapeHtml(text);
-
-  // Bold+italic ***...***
-  text = text.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
-  // Bold **...** or __...__
-  text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
-  // Italic *...* or _..._
-  text = text.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
-  text = text.replace(/(?<!_)_([^_\n]+)_(?!_)/g, "<em>$1</em>");
-  // Links [text](url)
-  text = text.replace(
-    /\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
-    (_, label, url, title) =>
-      `<a href="${url}"${title ? ` title="${title}"` : ""}>${label}</a>`
-  );
-  // Strikethrough ~~...~~
-  text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-
-  // Restore code spans
-  text = text.replace(/\x00CODE(\d+)\x00/g, (_, i) => {
-    return `<code>${escapeHtml(codeSpans[parseInt(i, 10)])}</code>`;
-  });
-
-  return text;
-}
-
-function renderMarkdown(md) {
-  const lines = md.replace(/\r\n/g, "\n").split("\n");
-  const out = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // Blank line
-    if (line.trim() === "") {
-      i++;
-      continue;
-    }
-
-    // Fenced code block
-    if (/^```/.test(line.trim())) {
-      const lang = line.trim().slice(3).trim();
-      const codeLines = [];
-      i++;
-      while (i < lines.length && !/^```/.test(lines[i].trim())) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing ```
-      out.push(
-        `<pre><code class="language-${lang || "plaintext"}">${escapeHtml(
-          codeLines.join("\n")
-        )}</code></pre>`
-      );
-      continue;
-    }
-
-    // Heading
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      const text = headingMatch[2].replace(/#+\s*$/, "").trim();
-      const id = text
-        .toLowerCase()
-        .replace(/[^\w\s-]/g, "")
-        .replace(/\s+/g, "-");
-      out.push(
-        `<h${level} id="${id}">${renderInline(text)}</h${level}>`
-      );
-      i++;
-      continue;
-    }
-
-    // Horizontal rule
-    if (/^(\s*[-*_]){3,}\s*$/.test(line)) {
-      out.push("<hr>");
-      i++;
-      continue;
-    }
-
-    // Blockquote
-    if (/^>\s?/.test(line)) {
-      const quoteLines = [];
-      while (i < lines.length && /^>\s?/.test(lines[i])) {
-        quoteLines.push(lines[i].replace(/^>\s?/, ""));
-        i++;
-      }
-      out.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
-      continue;
-    }
-
-    // Table (pipe table)
-    if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|[-:\s|]+\|/.test(lines[i + 1])) {
-      const tableLines = [];
-      while (i < lines.length && /^\s*\|/.test(lines[i])) {
-        tableLines.push(lines[i]);
-        i++;
-      }
-      const header = tableLines[0]
-        .trim()
-        .slice(1, -1)
-        .split("|")
-        .map((c) => c.trim());
-      const rows = tableLines.slice(2).map((r) =>
-        r
-          .trim()
-          .slice(1, -1)
-          .split("|")
-          .map((c) => c.trim())
-      );
-      let html = "<table><thead><tr>";
-      for (const h of header) html += `<th>${renderInline(h)}</th>`;
-      html += "</tr></thead><tbody>";
-      for (const row of rows) {
-        html += "<tr>";
-        for (const cell of row) html += `<td>${renderInline(cell)}</td>`;
-        html += "</tr>";
-      }
-      html += "</tbody></table>";
-      out.push(html);
-      continue;
-    }
-
-    // Unordered list
-    if (/^\s*[-*+]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && (/^\s*[-*+]\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length > 0))) {
-        if (/^\s*[-*+]\s+/.test(lines[i])) {
-          items.push(lines[i].replace(/^\s*[-*+]\s+/, ""));
-          i++;
-        } else {
-          // continuation line
-          items[items.length - 1] += "\n" + lines[i].replace(/^\s{2,}/, "");
-          i++;
-        }
-      }
-      out.push(
-        "<ul>" +
-          items.map((item) => `<li>${renderInline(item.replace(/\n/g, "<br>"))}</li>`).join("") +
-          "</ul>"
-      );
-      continue;
-    }
-
-    // Ordered list
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && (/^\s*\d+\.\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length > 0))) {
-        if (/^\s*\d+\.\s+/.test(lines[i])) {
-          items.push(lines[i].replace(/^\s*\d+\.\s+/, ""));
-          i++;
-        } else {
-          items[items.length - 1] += "\n" + lines[i].replace(/^\s{2,}/, "");
-          i++;
-        }
-      }
-      out.push(
-        "<ol>" +
-          items.map((item) => `<li>${renderInline(item.replace(/\n/g, "<br>"))}</li>`).join("") +
-          "</ol>"
-      );
-      continue;
-    }
-
-    // Paragraph (collect until blank line or block element)
-    const paraLines = [];
-    while (
-      i < lines.length &&
-      lines[i].trim() !== "" &&
-      !/^```/.test(lines[i].trim()) &&
-      !/^#{1,6}\s+/.test(lines[i]) &&
-      !/^(\s*[-*_]){3,}\s*$/.test(lines[i]) &&
-      !/^>\s?/.test(lines[i]) &&
-      !/^\s*[-*+]\s+/.test(lines[i]) &&
-      !/^\s*\d+\.\s+/.test(lines[i]) &&
-      !/^\s*\|/.test(lines[i])
-    ) {
-      paraLines.push(lines[i]);
-      i++;
-    }
-    if (paraLines.length > 0) {
-      out.push(`<p>${renderInline(paraLines.join(" "))}</p>`);
-    }
-  }
-
-  return out.join("\n");
 }
 
 // ── TOC extraction ─────────────────────────────────────────────────────────
@@ -818,6 +634,68 @@ mark.mdhtml-hl:hover {
   color: var(--accent);
   font-weight: 500;
 }
+.hl-card-note {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  border-left: 2px solid var(--accent);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.hl-card-note-edit {
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  line-height: 1.4;
+  resize: vertical;
+  outline: none;
+  margin-top: 6px;
+}
+.hl-card-note-edit:focus {
+  border-color: var(--accent);
+}
+.hl-card-note-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.hl-card-note-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+}
+.hl-card-note-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.hl-card-note-btn.save {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.hl-card-add-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  margin-top: 4px;
+  text-decoration: underline;
+}
+.hl-card-add-note:hover {
+  color: var(--accent);
+}
 .hl-panel::-webkit-scrollbar { width: 6px; }
 .hl-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 /* Mobile */
@@ -995,20 +873,86 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       var h = hls[i];
       var preview = h.text.length > 120 ? h.text.slice(0, 117) + '\\u2026' : h.text;
       var section = h.sectionTitle ? escapeText(h.sectionTitle) : '(top)';
+      var noteHtml = h.note
+        ? '<div class="hl-card-note">' + escapeText(h.note) + '</div>'
+        : '<div class="hl-card-add-note">+ add note</div>';
       html += '<div class="hl-card" data-hl-id="' + h.id + '">'
         + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
         + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span></div>'
+        + noteHtml
         + '</div>';
     }
     listEl.innerHTML = html;
     listEl.querySelectorAll('.hl-card').forEach(function(card){
-      card.addEventListener('click', function(){
-        var id = card.dataset.hlId;
-        var mark = content.querySelector('mark.mdhtml-hl[data-hl-id="' + id + '"]');
-        if (mark) {
-          mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      });
+      var id = card.dataset.hlId;
+      var mark = content.querySelector('mark.mdhtml-hl[data-hl-id="' + id + '"]');
+      var textEl = card.querySelector('.hl-card-text');
+      if (textEl) {
+        textEl.addEventListener('click', function(e){
+          e.stopPropagation();
+          if (mark) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+      }
+      var noteEl = card.querySelector('.hl-card-note');
+      var addNoteEl = card.querySelector('.hl-card-add-note');
+      var target = noteEl || addNoteEl;
+      if (target) {
+        target.addEventListener('click', function(e){
+          e.stopPropagation();
+          openNoteEditor(card, id, noteEl ? h.note : '');
+        });
+      }
+    });
+  }
+
+  function openNoteEditor(card, id, currentNote) {
+    var existing = card.querySelector('.hl-card-note-edit');
+    if (existing) { existing.focus(); return; }
+    var noteEl = card.querySelector('.hl-card-note');
+    var addNoteEl = card.querySelector('.hl-card-add-note');
+    if (noteEl) noteEl.style.display = 'none';
+    if (addNoteEl) addNoteEl.style.display = 'none';
+    var editor = document.createElement('textarea');
+    editor.className = 'hl-card-note-edit';
+    editor.value = currentNote;
+    editor.placeholder = 'Type a note for the AI agent\\u2026';
+    card.appendChild(editor);
+    var actions = document.createElement('div');
+    actions.className = 'hl-card-note-actions';
+    var saveBtn = document.createElement('span');
+    saveBtn.className = 'hl-card-note-btn save';
+    saveBtn.textContent = 'Save';
+    var cancelBtn = document.createElement('span');
+    cancelBtn.className = 'hl-card-note-btn';
+    cancelBtn.textContent = 'Cancel';
+    actions.appendChild(saveBtn);
+    actions.appendChild(cancelBtn);
+    card.appendChild(actions);
+    editor.focus();
+    function cleanup() {
+      editor.remove();
+      actions.remove();
+      if (noteEl) noteEl.style.display = '';
+      if (addNoteEl) addNoteEl.style.display = '';
+    }
+    saveBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      var note = editor.value.trim();
+      fetch('/__highlights__/' + id, {
+        method: 'PATCH',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ note: note })
+      }).then(function(r){return r.json()}).then(function(){
+        loadAndApply();
+      }).catch(function(){});
+    });
+    cancelBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      cleanup();
+    });
+    editor.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveBtn.click(); }
+      if (e.key === 'Escape') { e.preventDefault(); cleanup(); }
     });
   }
 
@@ -1329,9 +1273,9 @@ function serveAuto(inputPath, opts) {
       });
       return;
     }
-    const delMatch = req.url.match(/^\/__highlights__\/(.+)$/);
-    if (delMatch && req.method === "DELETE") {
-      const id = delMatch[1];
+    const hlIdMatch = req.url.match(/^\/__highlights__\/(.+)$/);
+    if (hlIdMatch && req.method === "DELETE") {
+      const id = hlIdMatch[1];
       const removed = removeHighlight(inputPath, id);
       if (removed) {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1341,6 +1285,27 @@ function serveAuto(inputPath, opts) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "not found" }));
       }
+      return;
+    }
+    if (hlIdMatch && req.method === "PATCH") {
+      const id = hlIdMatch[1];
+      readBody(req).then((body) => {
+        try {
+          const data = JSON.parse(body);
+          const hl = setHighlightNote(inputPath, id, data.note || "");
+          if (hl) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(hl));
+            broadcastHighlights();
+          } else {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "not found" }));
+          }
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
       return;
     }
 
@@ -1392,6 +1357,88 @@ function serveAuto(inputPath, opts) {
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 const opts = parseArgs(process.argv.slice(2));
+
+// ── Prime: AI agent instructions ───────────────────────────────────────────
+if (opts.prime) {
+  console.log(`# spotlight-md (mdhtml) — AI Agent Guide
+
+## What this tool does
+
+spotlight-md renders a markdown file as a dark-themed HTML page with
+live reload. A human reviewer reads the document in their browser and
+highlights passages that need attention. Each highlight is stored in a
+sidecar JSON file (NOT in the markdown itself) so your edits to the
+markdown never conflict with the highlight annotations.
+
+## The review cycle
+
+1. You (the AI) edit the markdown document.
+2. The human reads it in their browser and highlights passages.
+   They can also attach a note to each highlight.
+3. The human tells you to check highlights.
+4. You read the highlights (and their notes), fix the issues in the
+   markdown, then clear the highlights you have addressed.
+5. The browser auto-reloads so the human sees your changes immediately.
+
+## Commands
+
+### Read highlights (do this when the human asks you to review them)
+
+  mdhtml --list-highlights path/to/document.md
+
+Output format:
+  hl-<id>  §<section-id>
+    "<quoted passage text>"
+    note: "<note text if present>"
+    created: <timestamp>
+
+Each highlight includes:
+  - id:           short identifier (e.g. hl-abc123) for deletion
+  - sectionId:    HTML id of the nearest preceding heading
+  - sectionTitle: heading text for context
+  - text:         the exact passage the human highlighted
+  - note:         optional note the human attached (may be empty)
+  - createdAt:    ISO timestamp
+
+### Delete a single highlight (after addressing that specific issue)
+
+  mdhtml --delete-highlight hl-abc123 path/to/document.md
+
+### Clear all highlights (after addressing every issue)
+
+  mdhtml --clear-highlights path/to/document.md
+
+### Serve a document for the human to review
+
+  mdhtml --auto --theme dracula path/to/document.md
+
+This starts a local server (default port 7231) and opens the browser.
+The human can select text to create highlights, click highlights to
+delete them, and click highlight cards in the right panel to add notes.
+The server watches the file — when you save changes to the markdown,
+the browser reloads automatically.
+
+## Sidecar storage
+
+Highlights are stored in:  <filename>.highlights.json
+This file is managed by spotlight-md. Do not edit it by hand. Do not
+commit it to version control (add *.highlights.json to .gitignore).
+
+## Workflow rules
+
+- ALWAYS read highlights before clearing them.
+- Only clear highlights after you have edited the markdown to address
+  the issue each highlight raises.
+- Pay attention to the note field — the human may give specific
+  instructions about what to change.
+- You can delete highlights one at a time as you address each issue,
+  or clear them all at once when done.
+- The highlight text is the exact passage from the document at the time
+  the human selected it. Use it to locate the relevant section.
+- After editing, save the file. The browser will auto-reload and the
+  human can verify your changes.`);
+  process.exit(0);
+}
 
 if (opts.files.length === 0) {
   console.error("Usage: mdhtml [--auto] [--port N] [--output PATH] file.md");
