@@ -669,7 +669,7 @@ mark.mdhtml-hl:hover {
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 6px 14px;
+  padding: 8px 10px;
   font-size: 13px;
   font-weight: 600;
   color: var(--accent);
@@ -677,6 +677,9 @@ mark.mdhtml-hl:hover {
   box-shadow: 0 4px 12px rgba(0,0,0,0.4);
   user-select: none;
   transition: background 0.15s, border-color 0.15s;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .hl-popup:hover {
   background: var(--accent-dim);
@@ -783,21 +786,75 @@ mark.mdhtml-hl:hover {
   color: var(--accent);
   font-weight: 500;
 }
-.hl-card-note {
-  margin-top: 6px;
+/* Card status states */
+.hl-card.resolved { opacity: 0.55; }
+.hl-card.completed { opacity: 0.4; }
+.hl-card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.hl-card-status.resolved { color: #3fb950; }
+.hl-card-status.completed { color: var(--text-muted); }
+/* Resolve button */
+.hl-card-resolve-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  margin-left: auto;
+  white-space: nowrap;
+}
+.hl-card-resolve-btn:hover {
+  border-color: #3fb950;
+  color: #3fb950;
+}
+.hl-card-resolve-btn.resolved {
+  color: #3fb950;
+  border-color: #3fb950;
+}
+/* Conversation thread */
+.hl-thread {
+  margin-top: 8px;
+}
+.hl-msg {
   padding: 6px 8px;
-  background: var(--bg-tertiary);
   border-radius: 4px;
   font-size: 12px;
   color: var(--text);
   line-height: 1.4;
-  border-left: 2px solid var(--accent);
+  margin-bottom: 4px;
   white-space: pre-wrap;
   word-break: break-word;
 }
-.hl-card-note-edit {
+.hl-msg-human {
+  background: var(--bg-tertiary);
+  border-left: 2px solid var(--accent);
+}
+.hl-msg-ai {
+  background: var(--bg-tertiary);
+  border-left: 2px solid var(--link);
+}
+.hl-msg-header {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 3px;
+}
+.hl-msg-header.human { color: var(--accent); }
+.hl-msg-header.ai { color: var(--link); }
+/* Reply box */
+.hl-reply-box {
   width: 100%;
-  min-height: 44px;
+  min-height: 36px;
   padding: 6px 8px;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -808,17 +865,16 @@ mark.mdhtml-hl:hover {
   line-height: 1.4;
   resize: vertical;
   outline: none;
-  margin-top: 6px;
+  margin-top: 4px;
 }
-.hl-card-note-edit:focus {
-  border-color: var(--accent);
-}
-.hl-card-note-actions {
+.hl-reply-box:focus { border-color: var(--accent); }
+.hl-reply-actions {
   display: flex;
   gap: 6px;
   margin-top: 4px;
+  align-items: center;
 }
-.hl-card-note-btn {
+.hl-reply-btn {
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 4px;
@@ -827,50 +883,16 @@ mark.mdhtml-hl:hover {
   background: var(--bg-secondary);
   color: var(--text-muted);
 }
-.hl-card-note-btn:hover {
-  border-color: var(--accent);
-  color: var(--text);
-}
-.hl-card-note-btn.save {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.hl-card-add-note {
+.hl-reply-btn:hover { border-color: var(--accent); color: var(--text); }
+.hl-reply-btn.primary { color: var(--accent); border-color: var(--accent); }
+.hl-add-reply {
   font-size: 11px;
   color: var(--text-muted);
   cursor: pointer;
   margin-top: 4px;
   text-decoration: underline;
 }
-.hl-card-add-note:hover {
-  color: var(--accent);
-}
-/* AI comments (distinct from human notes) */
-.hl-card-comments {
-  margin-top: 6px;
-}
-.hl-card-comment {
-  padding: 6px 8px;
-  background: var(--bg-tertiary);
-  border-radius: 4px;
-  font-size: 12px;
-  color: var(--text);
-  line-height: 1.4;
-  border-left: 2px solid var(--link);
-  margin-bottom: 4px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.hl-card-comment-meta {
-  font-size: 10px;
-  color: var(--text-muted);
-  font-family: "SF Mono", Monaco, monospace;
-  margin-bottom: 3px;
-}
-.hl-card-comment-label {
-  color: var(--link);
-  font-weight: 500;
-}
+.hl-add-reply:hover { color: var(--accent); }
 .hl-panel::-webkit-scrollbar { width: 6px; }
 .hl-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 /* Mobile */
@@ -1048,33 +1070,56 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       var h = hls[i];
       var preview = h.text.length > 120 ? h.text.slice(0, 117) + '\\u2026' : h.text;
       var section = h.sectionTitle ? escapeText(h.sectionTitle) : '(top)';
-      var noteHtml = h.note
-        ? '<div class="hl-card-note">' + escapeText(h.note) + '</div>'
-        : '<div class="hl-card-add-note">+ add note</div>';
-      var commentsHtml = '';
-      if (h.comments && h.comments.length > 0) {
-        commentsHtml = '<div class="hl-card-comments">';
-        for (var j = 0; j < h.comments.length; j++) {
-          var c = h.comments[j];
-          var cprev = c.text.length > 200 ? c.text.slice(0, 197) + '\\u2026' : c.text;
-          commentsHtml += '<div class="hl-card-comment">'
-            + '<div class="hl-card-comment-meta"><span class="hl-card-comment-label">AI</span> \\u00b7 ' + c.id + '</div>'
-            + escapeText(cprev)
+      var cardClass = 'hl-card';
+      if (h.completed) cardClass += ' completed';
+      else if (h.resolved) cardClass += ' resolved';
+
+      var statusHtml = '';
+      if (h.completed) statusHtml = '<span class="hl-card-status completed">\\u2713 Done</span>';
+      else if (h.resolved) statusHtml = '<span class="hl-card-status resolved">\\u2713 Resolved</span>';
+
+      var resolveBtn = '';
+      if (!h.completed) {
+        resolveBtn = '<span class="hl-card-resolve-btn' + (h.resolved ? ' resolved' : '') + '" data-action="' + (h.resolved ? 'unresolve' : 'resolve') + '">' + (h.resolved ? 'Reopen' : 'Resolve') + '</span>';
+      }
+
+      // Conversation thread
+      var threadHtml = '';
+      if (h.messages && h.messages.length > 0) {
+        threadHtml = '<div class="hl-thread">';
+        for (var j = 0; j < h.messages.length; j++) {
+          var m = h.messages[j];
+          var author = m.author === 'human' ? 'YOU' : 'AI';
+          var msgClass = m.author === 'human' ? 'human' : 'ai';
+          threadHtml += '<div class="hl-msg hl-msg-' + msgClass + '">'
+            + '<div class="hl-msg-header ' + msgClass + '">' + author + '</div>'
+            + escapeText(m.text)
             + '</div>';
         }
-        commentsHtml += '</div>';
+        threadHtml += '</div>';
       }
-      html += '<div class="hl-card" data-hl-id="' + h.id + '">'
+
+      // Reply link (only if not completed)
+      var replyHtml = '';
+      if (!h.completed) {
+        replyHtml = '<div class="hl-add-reply" data-action="reply">+ reply</div>';
+      }
+
+      html += '<div class="' + cardClass + '" data-hl-id="' + h.id + '">'
         + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
-        + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span></div>'
-        + noteHtml
-        + commentsHtml
+        + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span>' + statusHtml + resolveBtn + '</div>'
+        + threadHtml
+        + replyHtml
         + '</div>';
     }
     listEl.innerHTML = html;
+
     listEl.querySelectorAll('.hl-card').forEach(function(card){
       var id = card.dataset.hlId;
       var mark = content.querySelector('mark.mdhtml-hl[data-hl-id="' + id + '"]');
+      var h = hls.find(function(x){return x.id === id});
+
+      // Click text to scroll to highlight
       var textEl = card.querySelector('.hl-card-text');
       if (textEl) {
         textEl.addEventListener('click', function(e){
@@ -1082,55 +1127,65 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
           if (mark) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
         });
       }
-      var noteEl = card.querySelector('.hl-card-note');
-      var addNoteEl = card.querySelector('.hl-card-add-note');
-      var target = noteEl || addNoteEl;
-      if (target) {
-        target.addEventListener('click', function(e){
+
+      // Resolve/unresolve button
+      var resolveEl = card.querySelector('.hl-card-resolve-btn');
+      if (resolveEl) {
+        resolveEl.addEventListener('click', function(e){
           e.stopPropagation();
-          openNoteEditor(card, id, noteEl ? h.note : '');
+          var action = resolveEl.dataset.action;
+          fetch('/__highlights__/' + id + '/' + action, { method: 'PATCH' })
+            .then(function(r){return r.json()})
+            .then(function(){ loadAndApply(); })
+            .catch(function(){});
+        });
+      }
+
+      // Reply link
+      var replyEl = card.querySelector('.hl-add-reply');
+      if (replyEl) {
+        replyEl.addEventListener('click', function(e){
+          e.stopPropagation();
+          openReplyBox(card, id);
         });
       }
     });
   }
 
-  function openNoteEditor(card, id, currentNote) {
-    var existing = card.querySelector('.hl-card-note-edit');
+  function openReplyBox(card, id) {
+    var existing = card.querySelector('.hl-reply-box');
     if (existing) { existing.focus(); return; }
-    var noteEl = card.querySelector('.hl-card-note');
-    var addNoteEl = card.querySelector('.hl-card-add-note');
-    if (noteEl) noteEl.style.display = 'none';
-    if (addNoteEl) addNoteEl.style.display = 'none';
+    var replyLink = card.querySelector('.hl-add-reply');
+    if (replyLink) replyLink.style.display = 'none';
     var editor = document.createElement('textarea');
-    editor.className = 'hl-card-note-edit';
-    editor.value = currentNote;
-    editor.placeholder = 'Type a note for the AI agent\\u2026';
+    editor.className = 'hl-reply-box';
+    editor.placeholder = 'Reply to the AI\\u2026';
     card.appendChild(editor);
     var actions = document.createElement('div');
-    actions.className = 'hl-card-note-actions';
-    var saveBtn = document.createElement('span');
-    saveBtn.className = 'hl-card-note-btn save';
-    saveBtn.textContent = 'Save';
+    actions.className = 'hl-reply-actions';
+    var sendBtn = document.createElement('span');
+    sendBtn.className = 'hl-reply-btn primary';
+    sendBtn.textContent = 'Send';
     var cancelBtn = document.createElement('span');
-    cancelBtn.className = 'hl-card-note-btn';
+    cancelBtn.className = 'hl-reply-btn';
     cancelBtn.textContent = 'Cancel';
-    actions.appendChild(saveBtn);
+    actions.appendChild(sendBtn);
     actions.appendChild(cancelBtn);
     card.appendChild(actions);
     editor.focus();
     function cleanup() {
       editor.remove();
       actions.remove();
-      if (noteEl) noteEl.style.display = '';
-      if (addNoteEl) addNoteEl.style.display = '';
+      if (replyLink) replyLink.style.display = '';
     }
-    saveBtn.addEventListener('click', function(e){
+    sendBtn.addEventListener('click', function(e){
       e.stopPropagation();
-      var note = editor.value.trim();
-      fetch('/__highlights__/' + id, {
-        method: 'PATCH',
+      var text = editor.value.trim();
+      if (!text) { cleanup(); return; }
+      fetch('/__highlights__/' + id + '/messages', {
+        method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ note: note })
+        body: JSON.stringify({ author: 'human', text: text })
       }).then(function(r){return r.json()}).then(function(){
         loadAndApply();
       }).catch(function(){});
@@ -1140,7 +1195,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       cleanup();
     });
     editor.addEventListener('keydown', function(e){
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveBtn.click(); }
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendBtn.click(); }
       if (e.key === 'Escape') { e.preventDefault(); cleanup(); }
     });
   }
@@ -1178,20 +1233,45 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     removeSelPopup();
     selPopup = document.createElement('div');
     selPopup.className = 'hl-popup';
-    selPopup.textContent = '\\u2726 Highlight';
     selPopup.style.left = x + 'px';
-    selPopup.style.top = (y - 36) + 'px';
+    selPopup.style.top = (y - 80) + 'px';
+    selPopup.style.padding = '8px 10px';
+    selPopup.style.flexDirection = 'column';
+    selPopup.style.gap = '6px';
+    selPopup.style.alignItems = 'stretch';
+    var btn = document.createElement('div');
+    btn.textContent = '\\u2726 Highlight';
+    btn.style.textAlign = 'center';
+    var noteInput = document.createElement('input');
+    noteInput.type = 'text';
+    noteInput.placeholder = 'Note (optional)\\u2026';
+    noteInput.style.background = 'var(--bg)';
+    noteInput.style.border = '1px solid var(--border)';
+    noteInput.style.borderRadius = '4px';
+    noteInput.style.padding = '3px 6px';
+    noteInput.style.fontSize = '12px';
+    noteInput.style.color = 'var(--text)';
+    noteInput.style.width = '160px';
+    noteInput.style.outline = 'none';
+    selPopup.appendChild(noteInput);
+    selPopup.appendChild(btn);
     selPopup.addEventListener('mousedown', function(e){ e.preventDefault(); });
-    selPopup.addEventListener('click', function(e){
-      e.preventDefault();
-      e.stopPropagation();
-      createHighlightFromSelection();
+    function submit() {
+      e.preventDefault && e.preventDefault();
+      e.stopPropagation && e.stopPropagation();
+      createHighlightFromSelection(noteInput.value.trim());
       removeSelPopup();
+    }
+    btn.addEventListener('click', submit);
+    noteInput.addEventListener('keydown', function(e){
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      if (e.key === 'Escape') { e.preventDefault(); removeSelPopup(); }
     });
     document.body.appendChild(selPopup);
+    setTimeout(function(){ noteInput.focus(); }, 50);
   }
 
-  function createHighlightFromSelection() {
+  function createHighlightFromSelection(note) {
     var sel = window.getSelection();
     if (sel.rangeCount === 0) return;
     var text = sel.toString().trim();
@@ -1200,7 +1280,8 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     var body = JSON.stringify({
       text: text,
       sectionId: heading ? heading.id : null,
-      sectionTitle: heading ? heading.title : null
+      sectionTitle: heading ? heading.title : null,
+      note: note || undefined
     });
     fetch('/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
       .then(function(r){return r.json()})
@@ -1212,7 +1293,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       .catch(function(){});
   }
 
-  // -- Delete popup --
+  // -- Complete popup --
   function removeDelPopup() {
     if (delPopup) { delPopup.remove(); delPopup = null; }
   }
@@ -1224,23 +1305,23 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     var idSpan = document.createElement('span');
     idSpan.className = 'hl-id';
     idSpan.textContent = mark.dataset.hlId;
-    var delBtn = document.createElement('span');
-    delBtn.className = 'hl-del-btn';
-    delBtn.textContent = 'Delete';
-    delBtn.addEventListener('click', function(e){
+    var completeBtn = document.createElement('span');
+    completeBtn.className = 'hl-del-btn';
+    completeBtn.textContent = 'Complete';
+    completeBtn.addEventListener('click', function(e){
       e.preventDefault();
       e.stopPropagation();
-      deleteHighlight(mark.dataset.hlId);
+      completeHighlight(mark.dataset.hlId);
       removeDelPopup();
     });
     delPopup.appendChild(idSpan);
-    delPopup.appendChild(delBtn);
+    delPopup.appendChild(completeBtn);
     delPopup.style.left = x + 'px';
     delPopup.style.top = (y + 20) + 'px';
     document.body.appendChild(delPopup);
   }
 
-  function deleteHighlight(id) {
+  function completeHighlight(id) {
     fetch('/__highlights__/' + id, {method:'DELETE'})
       .then(function(r){return r.json()})
       .then(function(){
