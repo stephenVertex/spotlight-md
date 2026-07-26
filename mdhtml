@@ -14,7 +14,7 @@ import { randomBytes } from "node:crypto";
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, deleteHighlight: null, clearHighlights: false, prime: false, files: [] };
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, deleteHighlight: null, clearHighlights: false, addComment: null, commentText: null, prime: false, files: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
@@ -26,6 +26,8 @@ function parseArgs(argv) {
     else if (a === "--list-highlights") opts.listHighlights = true;
     else if (a === "--delete-highlight") opts.deleteHighlight = argv[++i];
     else if (a === "--clear-highlights") opts.clearHighlights = true;
+    else if (a === "--add-comment") opts.addComment = argv[++i];
+    else if (a === "--comment-text") opts.commentText = argv[++i];
     else if (a === "--help" || a === "-h") {
       console.log(`mdhtml — markdown → dark HTML with live reload
 
@@ -45,6 +47,8 @@ Options:
   --list-highlights List all highlights for the file
   --delete-highlight ID  Delete a highlight by its ID
   --clear-highlights Remove all highlights for the file
+  --add-comment ID   Add a comment to a highlight (requires --comment-text)
+  --comment-text TXT The comment text to add (used with --add-comment)
   prime              Print instructions for AI agents on how to use this tool
   -h, --help        Show this help`);
       process.exit(0);
@@ -105,6 +109,21 @@ function setHighlightNote(inputPath, id, note) {
   return hl;
 }
 
+function addHighlightComment(inputPath, id, text) {
+  const highlights = loadHighlights(inputPath);
+  const hl = highlights.find((h) => h.id === id);
+  if (!hl) return null;
+  if (!hl.comments) hl.comments = [];
+  const comment = {
+    id: "cmt-" + randomBytes(3).toString("hex"),
+    text: text,
+    createdAt: new Date().toISOString(),
+  };
+  hl.comments.push(comment);
+  saveHighlights(inputPath, highlights);
+  return { highlight: hl, comment };
+}
+
 function removeHighlight(inputPath, id) {
   const highlights = loadHighlights(inputPath);
   const idx = highlights.findIndex((h) => h.id === id);
@@ -129,6 +148,12 @@ function printHighlights(inputPath) {
     console.log(`    "${preview}"`);
     if (h.note) {
       console.log(`    note: "${h.note}"`);
+    }
+    if (h.comments && h.comments.length > 0) {
+      for (const c of h.comments) {
+        const cprev = c.text.length > 80 ? c.text.slice(0, 77) + "…" : c.text;
+        console.log(`    comment [${c.id}]: "${cprev}"`);
+      }
     }
     console.log(`    created: ${h.createdAt}\n`);
   }
@@ -696,6 +721,32 @@ mark.mdhtml-hl:hover {
 .hl-card-add-note:hover {
   color: var(--accent);
 }
+/* AI comments (distinct from human notes) */
+.hl-card-comments {
+  margin-top: 6px;
+}
+.hl-card-comment {
+  padding: 6px 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  border-left: 2px solid var(--link);
+  margin-bottom: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.hl-card-comment-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: "SF Mono", Monaco, monospace;
+  margin-bottom: 3px;
+}
+.hl-card-comment-label {
+  color: var(--link);
+  font-weight: 500;
+}
 .hl-panel::-webkit-scrollbar { width: 6px; }
 .hl-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 /* Mobile */
@@ -876,10 +927,24 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       var noteHtml = h.note
         ? '<div class="hl-card-note">' + escapeText(h.note) + '</div>'
         : '<div class="hl-card-add-note">+ add note</div>';
+      var commentsHtml = '';
+      if (h.comments && h.comments.length > 0) {
+        commentsHtml = '<div class="hl-card-comments">';
+        for (var j = 0; j < h.comments.length; j++) {
+          var c = h.comments[j];
+          var cprev = c.text.length > 200 ? c.text.slice(0, 197) + '\\u2026' : c.text;
+          commentsHtml += '<div class="hl-card-comment">'
+            + '<div class="hl-card-comment-meta"><span class="hl-card-comment-label">AI</span> \\u00b7 ' + c.id + '</div>'
+            + escapeText(cprev)
+            + '</div>';
+        }
+        commentsHtml += '</div>';
+      }
       html += '<div class="hl-card" data-hl-id="' + h.id + '">'
         + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
         + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span></div>'
         + noteHtml
+        + commentsHtml
         + '</div>';
     }
     listEl.innerHTML = html;
@@ -1309,6 +1374,35 @@ function serveAuto(inputPath, opts) {
       return;
     }
 
+    // Comment endpoint: POST /__highlights__/:id/comments
+    const cmtMatch = req.url.match(/^\/__highlights__\/(.+)\/comments$/);
+    if (cmtMatch && req.method === "POST") {
+      const id = cmtMatch[1];
+      readBody(req).then((body) => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.text || data.text.trim().length < 1) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "text required" }));
+            return;
+          }
+          const result = addHighlightComment(inputPath, id, data.text.trim());
+          if (result) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result));
+            broadcastHighlights();
+          } else {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "highlight not found" }));
+          }
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
     if (req.url === "/__mtime__") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(String(mtime));
@@ -1399,9 +1493,19 @@ Each highlight includes:
   - sectionTitle: heading text for context
   - text:         the exact passage the human highlighted
   - note:         optional note the human attached (may be empty)
+  - comments:     optional array of AI comments (see below)
   - createdAt:    ISO timestamp
 
-### Delete a single highlight (after addressing that specific issue)
+### Add a comment to a highlight (after addressing the issue)
+
+  spotlight-md --add-comment hl-abc123 --comment-text "Replaced the metaphor with a concrete example in paragraph 3" path/to/document.md
+
+Comments appear in the right panel under the highlight card, visually
+distinct from human notes (blue left border vs accent left border).
+Use comments to explain what you changed and why, so the human can
+verify your work without searching the diff.
+
+### Delete a single highlight (only when the human explicitly asks)
 
   mdhtml --delete-highlight hl-abc123 path/to/document.md
 
@@ -1440,7 +1544,10 @@ commit it to version control (add *.highlights.json to .gitignore).
 - The highlight text is the exact passage from the document at the time
   the human selected it. Use it to locate the relevant section.
 - After editing, save the file. The browser will auto-reload and the
-  human can verify your changes.`);
+  human can verify your changes.
+- Add a comment to each highlight you address, explaining what you
+  changed. This closes the feedback loop — the human sees your
+  response without needing to read the full diff.`);
   process.exit(0);
 }
 
@@ -1476,6 +1583,21 @@ if (opts.deleteHighlight) {
     console.log(`  deleted ${opts.deleteHighlight} from ${basename(inputPath)}`);
   } else {
     console.error(`  highlight ${opts.deleteHighlight} not found`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+if (opts.addComment) {
+  if (!opts.commentText) {
+    console.error("  --add-comment requires --comment-text");
+    process.exit(1);
+  }
+  const result = addHighlightComment(inputPath, opts.addComment, opts.commentText);
+  if (result) {
+    console.log(`  added comment ${result.comment.id} to ${opts.addComment}`);
+  } else {
+    console.error(`  highlight ${opts.addComment} not found`);
     process.exit(1);
   }
   process.exit(0);
