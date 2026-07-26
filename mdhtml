@@ -1376,8 +1376,9 @@ markdown never conflict with the highlight annotations.
 2. The human reads it in their browser and highlights passages.
    They can also attach a note to each highlight.
 3. The human tells you to check highlights.
-4. You read the highlights (and their notes), fix the issues in the
-   markdown, then clear the highlights you have addressed.
+4. You read the highlights (and their notes) and fix the issues in the
+   markdown. DO NOT clear or delete highlights — the human will clear
+   them when satisfied.
 5. The browser auto-reloads so the human sees your changes immediately.
 
 ## Commands
@@ -1426,13 +1427,16 @@ commit it to version control (add *.highlights.json to .gitignore).
 
 ## Workflow rules
 
-- ALWAYS read highlights before clearing them.
-- Only clear highlights after you have edited the markdown to address
-  the issue each highlight raises.
+- NEVER clear or delete highlights unless the human explicitly asks
+  you to. Highlights are the human's annotations — they remain until
+  the human decides they are resolved.
+- Read highlights with --list-highlights when the human asks you to
+  review them.
+- Edit the markdown to address the issues raised by highlights, but
+  leave the highlights in place. The human will clear them when
+  satisfied.
 - Pay attention to the note field — the human may give specific
   instructions about what to change.
-- You can delete highlights one at a time as you address each issue,
-  or clear them all at once when done.
 - The highlight text is the exact passage from the document at the time
   the human selected it. Use it to locate the relevant section.
 - After editing, save the file. The browser will auto-reload and the
