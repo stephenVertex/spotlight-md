@@ -736,6 +736,35 @@ mark.mdhtml-hl:hover {
   font-size: 13px;
   font-weight: 600;
   color: var(--heading);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.hl-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.hl-filter-btn {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.hl-filter-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.hl-filter-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-dim);
 }
 .hl-panel-count {
   color: var(--text-muted);
@@ -976,6 +1005,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   if (!content) return;
   var selPopup = null;
   var delPopup = null;
+  var hideResolved = true;
 
   // -- Apply a single highlight to the DOM --
   function applyHighlight(hl) {
@@ -1059,15 +1089,25 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   function renderPanel(hls) {
     var countEl = document.getElementById('hl-panel-count');
     var listEl = document.getElementById('hl-panel-list');
-    if (countEl) countEl.textContent = '(' + hls.length + ')';
+    var filterBtn = document.getElementById('hl-filter-btn');
+    if (filterBtn) {
+      filterBtn.classList.toggle('active', hideResolved);
+      filterBtn.textContent = hideResolved ? 'Show resolved' : 'Hide resolved';
+      filterBtn.onclick = function() {
+        hideResolved = !hideResolved;
+        renderPanel(hls);
+      };
+    }
+    var visible = hideResolved ? hls.filter(function(h){ return !h.resolved && !h.completed; }) : hls;
+    if (countEl) countEl.textContent = '(' + visible.length + (visible.length !== hls.length ? '/' + hls.length : '') + ')';
     if (!listEl) return;
-    if (hls.length === 0) {
-      listEl.innerHTML = '<div class="hl-panel-empty">Select text in the document to highlight passages.</div>';
+    if (visible.length === 0) {
+      listEl.innerHTML = '<div class="hl-panel-empty">' + (hls.length > 0 ? 'All highlights resolved.' : 'Select text in the document to highlight passages.') + '</div>';
       return;
     }
     var html = '';
-    for (var i = 0; i < hls.length; i++) {
-      var h = hls[i];
+    for (var i = 0; i < visible.length; i++) {
+      var h = visible[i];
       var preview = h.text.length > 120 ? h.text.slice(0, 117) + '\\u2026' : h.text;
       var section = h.sectionTitle ? escapeText(h.sectionTitle) : '(top)';
       var cardClass = 'hl-card';
@@ -1396,7 +1436,10 @@ ${sidebarHtml}
 ${frontmatterHtml ? frontmatterHtml + "\n" : ""}${bodyHtml}
   </main>
   <aside class="hl-panel" id="hl-panel">
-    <div class="hl-panel-header">Highlights <span class="hl-panel-count" id="hl-panel-count"></span></div>
+    <div class="hl-panel-header">
+      <div class="hl-panel-title">Highlights <span class="hl-panel-count" id="hl-panel-count"></span></div>
+      <div class="hl-filter-btn active" id="hl-filter-btn">Hide resolved</div>
+    </div>
     <div id="hl-panel-list"><div class="hl-panel-empty">Select text in the document to highlight passages.</div></div>
   </aside>
 </div>
