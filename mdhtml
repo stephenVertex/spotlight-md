@@ -1317,14 +1317,18 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     selPopup.appendChild(btn);
     selPopup.addEventListener('mousedown', function(e){ e.preventDefault(); });
     function submit(event) {
-      event.preventDefault();
-      event.stopPropagation();
+      // Click handlers receive an event, but keyboard submission calls this
+      // helper directly. Do not make creating a highlight depend on one.
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
       createHighlightFromSelection(selection, noteInput.value.trim());
       removeSelPopup();
     }
     btn.addEventListener('click', submit);
     noteInput.addEventListener('keydown', function(e){
-      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      if (e.key === 'Enter') { e.preventDefault(); submit(e); }
       if (e.key === 'Escape') { e.preventDefault(); removeSelPopup(); }
     });
     document.body.appendChild(selPopup);

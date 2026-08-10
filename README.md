@@ -70,7 +70,7 @@ In `--auto` mode, the server watches the markdown file. When you (or an AI agent
 
 Select any text in the browser to create a highlight. A `Highlight` popup appears above your selection — click it to save. Highlights are stored in a SQLite sidecar `<file>.md.highlights.db` next to the source markdown, never in the markdown itself.
 
-- **Create**: Select text in the browser, click the popup.
+- **Create**: Select text in the browser, type an optional note, then click the popup or press Enter.
 - **Delete**: Click a highlighted passage in the document, then click Delete.
 - **Notes**: Click a highlight card in the right panel to add or edit a note.
 - **Browse**: The right panel shows all highlights with text preview, ID, section, and notes. Click a card to scroll to that highlight.

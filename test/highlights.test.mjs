@@ -91,13 +91,13 @@ test("browser highlight API creates the expected SQLite sidecar and survives ser
 test("selection popup submit handler receives its event instead of referencing an undeclared variable", () => {
   const source = readFileSync(toolPath, "utf8");
   assert.equal(
-    /function submit\(event\) \{\s*event\.preventDefault\(\);/.test(source),
+    /function submit\(event\) \{[\s\S]*?if \(event\) \{[\s\S]*?event\.preventDefault\(\);/.test(source),
     true,
-    "the popup submit callback must receive the click or keyboard event",
+    "the popup submit callback must accept direct keyboard submission without an event",
   );
   assert.equal(
-    /function submit\(\) \{\s*e\.preventDefault/.test(source),
-    false,
-    "the popup must not reference an undeclared event variable",
+    /if \(e\.key === 'Enter'\) \{ e\.preventDefault\(\); submit\(e\); \}/.test(source),
+    true,
+    "pressing Enter in the note field must pass its keyboard event to submit",
   );
 });
