@@ -1249,9 +1249,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   }
 
   // -- Nearest preceding heading --
-  function nearestHeading(sel) {
-    if (sel.rangeCount === 0) return null;
-    var range = sel.getRangeAt(0);
+  function nearestHeading(range) {
     var startEl = range.startContainer;
     if (startEl.nodeType === 3) startEl = startEl.parentElement;
     var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
@@ -1264,12 +1262,27 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     return nearest ? { id: nearest.id, title: nearest.textContent.replace(/<[^>]+>/g,'') } : null;
   }
 
+  function selectedHighlightData() {
+    var sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return null;
+    var range = sel.getRangeAt(0);
+    if (!content.contains(range.commonAncestorContainer)) return null;
+    var text = sel.toString().trim();
+    if (text.length < 2) return null;
+    var heading = nearestHeading(range);
+    return {
+      text: text,
+      sectionId: heading ? heading.id : null,
+      sectionTitle: heading ? heading.title : null
+    };
+  }
+
   // -- Selection popup --
   function removeSelPopup() {
     if (selPopup) { selPopup.remove(); selPopup = null; }
   }
 
-  function showSelPopup(x, y) {
+  function showSelPopup(x, y, selection) {
     removeSelPopup();
     selPopup = document.createElement('div');
     selPopup.className = 'hl-popup';
@@ -1296,10 +1309,10 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     selPopup.appendChild(noteInput);
     selPopup.appendChild(btn);
     selPopup.addEventListener('mousedown', function(e){ e.preventDefault(); });
-    function submit() {
-      e.preventDefault && e.preventDefault();
-      e.stopPropagation && e.stopPropagation();
-      createHighlightFromSelection(noteInput.value.trim());
+    function submit(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      createHighlightFromSelection(selection, noteInput.value.trim());
       removeSelPopup();
     }
     btn.addEventListener('click', submit);
@@ -1311,21 +1324,21 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     setTimeout(function(){ noteInput.focus(); }, 50);
   }
 
-  function createHighlightFromSelection(note) {
-    var sel = window.getSelection();
-    if (sel.rangeCount === 0) return;
-    var text = sel.toString().trim();
-    if (!text) return;
-    var heading = nearestHeading(sel);
+  function createHighlightFromSelection(selection, note) {
+    if (!selection || !selection.text) return;
     var body = JSON.stringify({
-      text: text,
-      sectionId: heading ? heading.id : null,
-      sectionTitle: heading ? heading.title : null,
+      text: selection.text,
+      sectionId: selection.sectionId,
+      sectionTitle: selection.sectionTitle,
       note: note || undefined
     });
     fetch('/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
-      .then(function(r){return r.json()})
+      .then(function(r){
+        if (!r.ok) throw new Error('could not create highlight');
+        return r.json();
+      })
       .then(function(hl){
+        var sel = window.getSelection();
         sel.removeAllRanges();
         applyHighlight(hl);
         loadAndApply();
@@ -1374,14 +1387,13 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   document.addEventListener('mouseup', function(e){
     if (e.target.closest('.hl-popup, .hl-delete-popup, .sidebar')) return;
     setTimeout(function(){
-      var sel = window.getSelection();
-      var text = sel.toString().trim();
+      var selection = selectedHighlightData();
       removeSelPopup();
       removeDelPopup();
-      if (text.length < 2) return;
-      var range = sel.getRangeAt(0);
+      if (!selection) return;
+      var range = window.getSelection().getRangeAt(0);
       var rect = range.getBoundingClientRect();
-      showSelPopup(rect.left + rect.width/2 - 50, rect.top);
+      showSelPopup(rect.left + rect.width/2 - 50, rect.top, selection);
     }, 10);
   });
 
