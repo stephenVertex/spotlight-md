@@ -39,9 +39,10 @@ async function waitForServer(url, child) {
 }
 
 async function stop(child) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
   child.kill("SIGTERM");
-  await once(child, "exit");
+  await exited;
 }
 
 test("browser highlight API creates the expected SQLite sidecar and survives server stop", async (t) => {

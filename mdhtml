@@ -75,7 +75,14 @@ Options:
 
 // ── Highlight storage (SQLite) ─────────────────────────────────────────────
 function dbFilePath(inputPath) {
-  return inputPath.replace(/\.md$/i, ".highlights.db");
+  const canonicalPath = `${inputPath}.highlights.db`;
+  const legacyPath = inputPath.replace(/\.md$/i, ".highlights.db");
+  // SQLite sidecars originally dropped the .md suffix. Keep using an
+  // existing legacy sidecar so upgrading does not hide prior highlights.
+  if (canonicalPath !== legacyPath && !existsSync(canonicalPath) && existsSync(legacyPath)) {
+    return legacyPath;
+  }
+  return canonicalPath;
 }
 
 function openDb(inputPath) {
@@ -1555,8 +1562,10 @@ function serveAuto(inputPath, opts) {
   }
 
   const server = createServer((req, res) => {
+    const pathname = new URL(req.url || "/", "http://localhost").pathname;
+
     // SSE channel
-    if (req.url === "/__reload__") {
+    if (pathname === "/__reload__") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1572,13 +1581,13 @@ function serveAuto(inputPath, opts) {
     }
 
     // Highlight REST API
-    if (req.url === "/__highlights__" && req.method === "GET") {
+    if (pathname === "/__highlights__" && req.method === "GET") {
       const hls = loadHighlights(inputPath);
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(hls));
       return;
     }
-    if (req.url === "/__highlights__" && req.method === "POST") {
+    if (pathname === "/__highlights__" && req.method === "POST") {
       readBody(req).then((body) => {
         try {
           const data = JSON.parse(body);
@@ -1588,7 +1597,10 @@ function serveAuto(inputPath, opts) {
             return;
           }
           const hl = addHighlight(inputPath, data);
-          res.writeHead(200, { "Content-Type": "application/json" });
+          res.writeHead(201, {
+            "Content-Type": "application/json",
+            Location: `/__highlights__/${hl.id}`,
+          });
           res.end(JSON.stringify(hl));
           broadcastHighlights();
         } catch (e) {
@@ -1598,7 +1610,7 @@ function serveAuto(inputPath, opts) {
       });
       return;
     }
-    const hlIdMatch = req.url.match(/^\/__highlights__\/(.+)$/);
+    const hlIdMatch = pathname.match(/^\/__highlights__\/([^/]+)$/);
     if (hlIdMatch && req.method === "DELETE") {
       const id = hlIdMatch[1];
       const removed = removeHighlight(inputPath, id);
@@ -1635,7 +1647,7 @@ function serveAuto(inputPath, opts) {
     }
 
     // Message endpoint: POST /__highlights__/:id/messages  (author defaults to "ai")
-    const msgMatch = req.url.match(/^\/__highlights__\/(.+)\/messages$/);
+    const msgMatch = pathname.match(/^\/__highlights__\/([^/]+)\/messages$/);
     if (msgMatch && req.method === "POST") {
       const id = msgMatch[1];
       readBody(req).then((body) => {
@@ -1665,7 +1677,7 @@ function serveAuto(inputPath, opts) {
     }
 
     // Resolve endpoint: PATCH /__highlights__/:id/resolve
-    const resolveMatch = req.url.match(/^\/__highlights__\/(.+)\/resolve$/);
+    const resolveMatch = pathname.match(/^\/__highlights__\/([^/]+)\/resolve$/);
     if (resolveMatch && req.method === "PATCH") {
       const id = resolveMatch[1];
       const hl = setHighlightResolved(inputPath, id, true);
@@ -1681,7 +1693,7 @@ function serveAuto(inputPath, opts) {
     }
 
     // Unresolve endpoint: PATCH /__highlights__/:id/unresolve
-    const unresolveMatch = req.url.match(/^\/__highlights__\/(.+)\/unresolve$/);
+    const unresolveMatch = pathname.match(/^\/__highlights__\/([^/]+)\/unresolve$/);
     if (unresolveMatch && req.method === "PATCH") {
       const id = unresolveMatch[1];
       const hl = setHighlightResolved(inputPath, id, false);
@@ -1696,7 +1708,7 @@ function serveAuto(inputPath, opts) {
       return;
     }
 
-    if (req.url === "/__mtime__") {
+    if (pathname === "/__mtime__") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(String(mtime));
       return;
