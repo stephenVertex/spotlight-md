@@ -1874,7 +1874,7 @@ Each highlight has:
 
 ## Sidecar storage
 
-Highlights are stored in:  <filename>.highlights.db (SQLite, WAL mode)
+Highlights are stored in:  <filename>.md.highlights.db (SQLite, WAL mode)
 This file is managed by spotlight-md. Do not edit it by hand. Do not
 commit it to version control (add *.highlights.db to .gitignore).
 
