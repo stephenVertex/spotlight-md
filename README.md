@@ -68,7 +68,7 @@ In `--auto` mode, the server watches the markdown file. When you (or an AI agent
 
 ### Highlights
 
-Select any text in the browser to create a highlight. A `Highlight` popup appears above your selection — click it to save. Highlights are stored in a sidecar `.highlights.json` file next to the source markdown, never in the markdown itself.
+Select any text in the browser to create a highlight. A `Highlight` popup appears above your selection — click it to save. Highlights are stored in a SQLite sidecar `<file>.md.highlights.db` next to the source markdown, never in the markdown itself.
 
 - **Create**: Select text in the browser, click the popup.
 - **Delete**: Click a highlighted passage in the document, then click Delete.
@@ -92,6 +92,6 @@ Highlights include the exact passage text, the nearest section heading, and any 
 | File | Description |
 |------|-------------|
 | `<name>.html` | Rendered HTML output |
-| `<name>.highlights.json` | Highlight annotations (managed by the tool) |
+| `<name>.md.highlights.db` | SQLite highlight annotations (managed by the tool) |
 
-Add `*.highlights.json` to `.gitignore`.
+Add `*.highlights.db` to `.gitignore`.
