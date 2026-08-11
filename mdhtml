@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // mdhtml — render markdown to a dark-themed HTML page with optional live reload.
 //   mdhtml file.md              → writes file.html
-//   mdhtml --auto file.md       → serves + watches + live-reloads in browser
+//   mdhtml --auto file.md       → registers with daemon + opens live browser view
 //   mdhtml -o out.html file.md  → specify output path
 //   mdhtml --port 4040 --auto file.md
 // Zero dependencies. Node 18+.
 
-import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync } from "node:fs";
+import { chmodSync, readFileSync, realpathSync, unlinkSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync } from "node:fs";
 import { resolve, dirname, basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 import { createServer } from "node:http";
@@ -18,12 +18,13 @@ const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
+  const opts = { auto: false, daemon: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
-    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
+    else if (["status", "stop", "list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
+    else if (a === "--daemon") opts.daemon = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
     else if (a === "--no-open") opts.open = false;
@@ -48,6 +49,9 @@ function parseArgs(argv) {
 
 Usage:
   spotlight-md --auto [--json] [--new-session] FILE.md
+  spotlight-md status [--port NUM] [--json]
+  spotlight-md stop [--port NUM] [--json]
+  spotlight-md -o OUTPUT.html FILE.md
   spotlight-md list-highlights --session-id ID [--json]
   spotlight-md get-highlight-details --session-id ID --highlight-id ID [--json]
   spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--json]
@@ -58,7 +62,9 @@ Usage:
   spotlight-md reopen-session --session-id ID
 
 Sessions and annotations live in ~/.config/spotlight-md/global-highlights-db.db.
---auto resumes the document's active session unless --new-session is set.
+--auto launches or reuses the local daemon on port 7231, registers the document,
+and resumes its active session unless --new-session is set. It does not write an
+HTML file; use -o for a static export.
 Use --json for stable machine-readable output.`);
       process.exit(0);
     } else if (a.startsWith("-")) {
@@ -959,27 +965,29 @@ mark.mdhtml-hl:hover {
 }
 `;
 
-function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName) {
+function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName, documentRoute = "") {
+  const apiBase = JSON.stringify(documentRoute);
   const reloadScript = autoMode
     ? `<div id="reload-badge">Reloading…</div>
 <script>
 (function(){
+  var apiBase = ${apiBase};
   var badge = document.getElementById('reload-badge');
   function showBadge(){ badge.classList.add('show'); }
   try {
-    var es = new EventSource('/__reload__');
+    var es = new EventSource(apiBase + '/__reload__');
     es.addEventListener('reload', function(){
       showBadge();
       setTimeout(function(){ location.reload(); }, 200);
     });
   } catch(e){
     setInterval(function(){
-      fetch('/__mtime__').then(r=>r.text()).then(function(t){
+      fetch(apiBase + '/__mtime__').then(r=>r.text()).then(function(t){
         if(window._mtime && t !== window._mtime){ showBadge(); setTimeout(function(){ location.reload(); }, 200); }
         window._mtime = t;
       }).catch(function(){});
     }, 1500);
-    fetch('/__mtime__').then(r=>r.text()).then(function(t){ window._mtime = t; });
+    fetch(apiBase + '/__mtime__').then(r=>r.text()).then(function(t){ window._mtime = t; });
   }
 })();
 </script>`
@@ -1026,6 +1034,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   const highlightScript = autoMode ? `
 <script>
 (function(){
+  var apiBase = ${apiBase};
   var content = document.querySelector('.content');
   if (!content) return;
   var selPopup = null;
@@ -1199,7 +1208,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         resolveEl.addEventListener('click', function(e){
           e.stopPropagation();
           var action = resolveEl.dataset.action;
-          fetch('/__highlights__/' + id + '/' + action, { method: 'PATCH' })
+          fetch(apiBase + '/__highlights__/' + id + '/' + action, { method: 'PATCH' })
             .then(function(r){return r.json()})
             .then(function(){ loadAndApply(); })
             .catch(function(){});
@@ -1247,7 +1256,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       e.stopPropagation();
       var text = editor.value.trim();
       if (!text) { cleanup(); return; }
-      fetch('/__highlights__/' + id + '/messages', {
+      fetch(apiBase + '/__highlights__/' + id + '/messages', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ author: 'human', text: text })
@@ -1266,7 +1275,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   }
 
   function loadAndApply() {
-    fetch('/__highlights__').then(function(r){return r.json()}).then(function(hls){
+    fetch(apiBase + '/__highlights__').then(function(r){return r.json()}).then(function(hls){
       clearHighlights();
       hls.forEach(applyHighlight);
       renderPanel(hls);
@@ -1361,7 +1370,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       sectionTitle: selection.sectionTitle,
       note: note || undefined
     });
-    fetch('/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
+    fetch(apiBase + '/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
       .then(function(r){
         if (!r.ok) throw new Error('could not create highlight');
         return r.json();
@@ -1404,7 +1413,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   }
 
   function completeHighlight(id) {
-    fetch('/__highlights__/' + id, {method:'DELETE'})
+    fetch(apiBase + '/__highlights__/' + id, {method:'DELETE'})
       .then(function(r){return r.json()})
       .then(function(){
         loadAndApply();
@@ -1444,7 +1453,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   // -- SSE: listen for highlight updates --
   try {
-    var es = new EventSource('/__reload__');
+    var es = new EventSource(apiBase + '/__reload__');
     es.addEventListener('highlights-updated', function(){
       loadAndApply();
     });
@@ -1537,6 +1546,449 @@ function writeStatic(inputPath, outputPath) {
   console.log(`  wrote ${outputPath}`);
 }
 
+// ── Persistent multi-document daemon ─────────────────────────────────────
+function daemonStatePath(port) {
+  const configDir = process.env.SPOTLIGHT_MD_CONFIG_DIR || join(homedir(), ".config", "spotlight-md");
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  return join(configDir, `daemon-${port}.json`);
+}
+
+function virtualDocumentRoute(inputPath) {
+  const renderedPath = inputPath.replace(/\.md$/i, ".html");
+  const segments = renderedPath.replace(/\\/g, "/").split("/").filter(Boolean);
+  return "/spotlight/" + segments.map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
+
+function normalizeUrlPath(pathname) {
+  return pathname.split("/").map((segment) => encodeURIComponent(decodeURIComponent(segment)).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
+
+function readRequestBody(req, limit = 1024 * 1024) {
+  return new Promise((resolveBody, rejectBody) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > limit) rejectBody(new Error("request body too large"));
+    });
+    req.on("end", () => resolveBody(data));
+    req.on("error", rejectBody);
+  });
+}
+
+function sendJson(res, status, value, extraHeaders = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", ...extraHeaders });
+  res.end(JSON.stringify(value));
+}
+
+function createDocumentState(inputPath, theme, session) {
+  const document = {
+    path: inputPath,
+    route: virtualDocumentRoute(inputPath),
+    theme,
+    session,
+    title: "",
+    html: "",
+    frontmatterHtml: "",
+    tocHtml: "",
+    mtime: 0,
+    clients: [],
+    debounceTimer: null,
+    watcher: null,
+  };
+
+  rebuildDocument(document);
+  document.watcher = () => {
+    if (document.debounceTimer) clearTimeout(document.debounceTimer);
+    document.debounceTimer = setTimeout(() => {
+      try {
+        rebuildDocument(document);
+        broadcastDocument(document, "reload");
+      } catch (error) {
+        console.error(`spotlight-md: could not re-render ${document.path}: ${error.message}`);
+      }
+    }, 150);
+  };
+  watchFile(document.path, { interval: 500 }, document.watcher);
+  return document;
+}
+
+function rebuildDocument(document) {
+  const rendered = renderFile(document.path);
+  document.title = rendered.title;
+  document.html = rendered.html;
+  document.frontmatterHtml = rendered.frontmatterHtml;
+  document.tocHtml = rendered.tocHtml;
+  document.mtime = statSync(document.path).mtimeMs;
+}
+
+function broadcastDocument(document, event) {
+  for (const client of document.clients) client.write(`event: ${event}\ndata: {}\n\n`);
+}
+
+function closeDocumentState(document) {
+  if (document.debounceTimer) clearTimeout(document.debounceTimer);
+  if (document.watcher) unwatchFile(document.path, document.watcher);
+  for (const client of document.clients) client.end();
+  document.clients.length = 0;
+}
+
+async function handleDocumentRequest(document, subpath, req, res) {
+  if (subpath === "" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(buildHtml(document.title, document.html, document.frontmatterHtml, document.tocHtml, true, document.theme, document.route));
+    return;
+  }
+
+  if (subpath === "/__reload__" && req.method === "GET") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write("retry: 2000\n\n");
+    document.clients.push(res);
+    req.on("close", () => {
+      const index = document.clients.indexOf(res);
+      if (index !== -1) document.clients.splice(index, 1);
+    });
+    return;
+  }
+
+  if (subpath === "/__session__" && req.method === "GET") {
+    sendJson(res, 200, { id: document.session.id, path: document.session.path, state: document.session.state });
+    return;
+  }
+  if (subpath === "/__highlights__" && req.method === "GET") {
+    sendJson(res, 200, loadHighlights(document.session.id));
+    return;
+  }
+  if (subpath === "/__highlights__" && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    if (!data.text || data.text.trim().length < 2) {
+      sendJson(res, 400, { error: "text required" });
+      return;
+    }
+    const highlight = addHighlight(document.session.id, data);
+    sendJson(res, 201, highlight, { Location: `${document.route}/__highlights__/${highlight.id}` });
+    broadcastDocument(document, "highlights-updated");
+    return;
+  }
+
+  const highlightMatch = subpath.match(/^\/__highlights__\/([^/]+)$/);
+  if (highlightMatch && req.method === "DELETE") {
+    const id = highlightMatch[1];
+    const removed = setHighlightResolved(document.session.id, id, true, true);
+    if (!removed) sendJson(res, 404, { error: "not found" });
+    else {
+      sendJson(res, 200, { ok: true, id });
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+  if (highlightMatch && req.method === "PATCH") {
+    sendJson(res, 410, { error: "editing an initial note is not supported" });
+    return;
+  }
+
+  const messageMatch = subpath.match(/^\/__highlights__\/([^/]+)\/messages$/);
+  if (messageMatch && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    if (!data.text || data.text.trim().length < 1) {
+      sendJson(res, 400, { error: "text required" });
+      return;
+    }
+    const result = addHighlightMessage(document.session.id, messageMatch[1], data.author || "ai", data.text.trim(), data.agentId || null);
+    if (!result) sendJson(res, 404, { error: "highlight not found" });
+    else {
+      sendJson(res, 200, result);
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+
+  const resolvedMatch = subpath.match(/^\/__highlights__\/([^/]+)\/(resolve|unresolve)$/);
+  if (resolvedMatch && req.method === "PATCH") {
+    const highlight = setHighlightResolved(document.session.id, resolvedMatch[1], resolvedMatch[2] === "resolve");
+    if (!highlight) sendJson(res, 404, { error: "not found" });
+    else {
+      sendJson(res, 200, highlight);
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+
+  if (subpath === "/__mtime__" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+    res.end(String(document.mtime));
+    return;
+  }
+
+  sendJson(res, 404, { error: "not found" });
+}
+
+function serveDaemon(daemonOpts) {
+  const token = process.env.SPOTLIGHT_MD_DAEMON_TOKEN || randomBytes(24).toString("hex");
+  const statePath = daemonStatePath(daemonOpts.port);
+  const documentsByRoute = new Map();
+  const documentsByPath = new Map();
+  const startedAt = new Date().toISOString();
+  let shuttingDown = false;
+
+  function isAuthorized(req) {
+    return req.headers["x-spotlight-token"] === token;
+  }
+
+  function status() {
+    return {
+      service: "spotlight-md",
+      version: VERSION,
+      running: true,
+      pid: process.pid,
+      port: daemonOpts.port,
+      startedAt,
+      documents: [...documentsByPath.values()].map((document) => ({
+        path: document.path,
+        route: document.route,
+        sessionId: document.session.id,
+      })),
+    };
+  }
+
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || "/", "http://localhost");
+      const pathname = normalizeUrlPath(url.pathname);
+      if (pathname === "/__spotlight__/health" && req.method === "GET") {
+        sendJson(res, 200, { service: "spotlight-md", version: VERSION });
+        return;
+      }
+      if (pathname === "/__spotlight__/status" && req.method === "GET") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        sendJson(res, 200, status());
+        return;
+      }
+      if (pathname === "/__spotlight__/register" && req.method === "POST") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        const registration = JSON.parse(await readRequestBody(req));
+        if (!registration.path || typeof registration.path !== "string") {
+          sendJson(res, 400, { error: "path required" });
+          return;
+        }
+        const canonicalPath = realpathSync(registration.path);
+        if (!statSync(canonicalPath).isFile()) {
+          sendJson(res, 400, { error: "path must be a file" });
+          return;
+        }
+        const session = getOrCreateSession(canonicalPath, !!registration.newSession);
+        let document = documentsByPath.get(canonicalPath);
+        if (document) {
+          document.theme = registration.theme || "github-dark";
+          document.session = session;
+          rebuildDocument(document);
+          broadcastDocument(document, "reload");
+        } else {
+          document = createDocumentState(canonicalPath, registration.theme || "github-dark", session);
+          if (documentsByRoute.has(document.route)) throw new Error("document route collision");
+          documentsByPath.set(canonicalPath, document);
+          documentsByRoute.set(document.route, document);
+        }
+        sendJson(res, 200, {
+          sessionId: session.id,
+          path: canonicalPath,
+          resumed: session.resumed,
+          route: document.route,
+          url: `http://localhost:${daemonOpts.port}${document.route}`,
+        });
+        return;
+      }
+      if (pathname === "/__spotlight__/stop" && req.method === "POST") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, pid: process.pid });
+        setTimeout(shutdown, 10);
+        return;
+      }
+
+      let matchedDocument = documentsByRoute.get(pathname);
+      let subpath = "";
+      if (!matchedDocument) {
+        for (const [route, document] of documentsByRoute) {
+          if (pathname.startsWith(route + "/__")) {
+            matchedDocument = document;
+            subpath = pathname.slice(route.length);
+            break;
+          }
+        }
+      }
+      if (!matchedDocument) {
+        sendJson(res, 404, { error: "document is not registered" });
+        return;
+      }
+      await handleDocumentRequest(matchedDocument, subpath, req, res);
+    } catch (error) {
+      if (!res.headersSent) sendJson(res, error instanceof URIError ? 400 : 500, { error: error.message });
+      else res.end();
+    }
+  });
+
+  function removeOwnStateFile() {
+    try {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      if (state.pid === process.pid && state.token === token) unlinkSync(statePath);
+    } catch { /* State may already be absent or replaced by another daemon. */ }
+  }
+
+  function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    for (const document of documentsByPath.values()) closeDocumentState(document);
+    removeOwnStateFile();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  }
+
+  server.on("error", (error) => {
+    console.error(`spotlight-md: daemon could not listen on port ${daemonOpts.port}: ${error.message}`);
+    process.exit(1);
+  });
+  server.listen(daemonOpts.port, "127.0.0.1", () => {
+    writeFileSync(statePath, JSON.stringify({ pid: process.pid, port: daemonOpts.port, token, startedAt }) + "\n", { mode: 0o600 });
+    chmodSync(statePath, 0o600);
+  });
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+function readDaemonState(port) {
+  try {
+    const state = JSON.parse(readFileSync(daemonStatePath(port), "utf8"));
+    if (state.port !== port || !Number.isInteger(state.pid) || typeof state.token !== "string") return null;
+    return state;
+  } catch {
+    return null;
+  }
+}
+
+function removeStaleDaemonState(port) {
+  try { unlinkSync(daemonStatePath(port)); }
+  catch { /* A missing state file is already clean. */ }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 1000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeDaemon(port) {
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/__spotlight__/health`);
+    const body = await response.json().catch(() => null);
+    return body && body.service === "spotlight-md" ? "running" : "occupied";
+  } catch {
+    return "stopped";
+  }
+}
+
+async function daemonRequest(port, state, pathname, method = "GET", body = undefined) {
+  const response = await fetchWithTimeout(`http://127.0.0.1:${port}${pathname}`, {
+    method,
+    headers: {
+      "X-Spotlight-Token": state.token,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }, 5000);
+  const value = await response.json().catch(() => ({ error: `daemon returned HTTP ${response.status}` }));
+  if (!response.ok) throw new Error(value.error || `daemon returned HTTP ${response.status}`);
+  return value;
+}
+
+async function ensureDaemon(port) {
+  const initialProbe = await probeDaemon(port);
+  if (initialProbe === "running") {
+    const state = readDaemonState(port);
+    if (!state) throw new Error(`daemon is running on port ${port}, but its control file is unavailable`);
+    await daemonRequest(port, state, "/__spotlight__/status");
+    return state;
+  }
+  if (initialProbe === "occupied") throw new Error(`port ${port} is already used by another service`);
+
+  removeStaleDaemonState(port);
+  const token = randomBytes(24).toString("hex");
+  const child = spawn(process.execPath, [resolve(process.argv[1]), "--daemon", "--port", String(port)], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, SPOTLIGHT_MD_DAEMON_TOKEN: token },
+  });
+  child.on("error", () => {});
+  child.unref();
+
+  for (let attempt = 0; attempt < 60; attempt++) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    const probe = await probeDaemon(port);
+    if (probe === "occupied") throw new Error(`port ${port} became occupied by another service`);
+    if (probe === "running") {
+      const state = readDaemonState(port);
+      if (state) {
+        try {
+          await daemonRequest(port, state, "/__spotlight__/status");
+          return state;
+        } catch { /* The winning daemon may still be publishing its control state. */ }
+      }
+    }
+  }
+  throw new Error(`timed out starting daemon on port ${port}`);
+}
+
+function openBrowser(url) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { stdio: "ignore", detached: true });
+  child.on("error", () => {});
+  child.unref();
+}
+
+async function registerWithDaemon(inputPath, registrationOpts) {
+  const state = await ensureDaemon(registrationOpts.port);
+  return daemonRequest(registrationOpts.port, state, "/__spotlight__/register", "POST", {
+    path: inputPath,
+    theme: registrationOpts.theme,
+    newSession: registrationOpts.newSession,
+  });
+}
+
+async function daemonStatus(port) {
+  const probe = await probeDaemon(port);
+  if (probe !== "running") {
+    if (probe === "stopped") removeStaleDaemonState(port);
+    return { service: "spotlight-md", running: false, port, reason: probe === "occupied" ? "port occupied by another service" : undefined };
+  }
+  const state = readDaemonState(port);
+  if (!state) throw new Error(`daemon is running on port ${port}, but its control file is unavailable`);
+  return daemonRequest(port, state, "/__spotlight__/status");
+}
+
+async function stopDaemon(port) {
+  const current = await daemonStatus(port);
+  if (!current.running) return { ok: false, running: false, port };
+  const state = readDaemonState(port);
+  return daemonRequest(port, state, "/__spotlight__/stop", "POST");
+}
+
 function serveAuto(inputPath, opts, session) {
   const report = opts.json ? console.error : console.log;
   let currentHtml = "";
@@ -1561,15 +2013,6 @@ function serveAuto(inputPath, opts, session) {
   }
 
   rebuild();
-
-  // Also write a static file alongside
-  const outputPath = opts.output || inputPath.replace(/\.md$/i, ".html");
-  function writeStaticCopy() {
-    try {
-      writeFileSync(outputPath, buildHtml(currentTitle, currentHtml, currentFrontmatter, currentToc, false, opts.theme));
-    } catch (e) { /* ignore */ }
-  }
-  writeStaticCopy();
 
   function broadcastHighlights() {
     for (const client of sseClients) {
@@ -1758,7 +2201,6 @@ function serveAuto(inputPath, opts, session) {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       rebuild();
-      writeStaticCopy();
       // Notify all connected browsers
       for (const client of sseClients) {
         client.write("event: reload\ndata: {}\n\n");
@@ -1779,6 +2221,16 @@ function serveAuto(inputPath, opts, session) {
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 const opts = parseArgs(process.argv.slice(2));
+
+if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+  console.error("spotlight-md: --port must be an integer between 1 and 65535");
+  process.exit(1);
+}
+
+if (opts.daemon) {
+  serveDaemon(opts);
+  await new Promise(() => {});
+}
 
 // ── Prime: AI agent instructions ───────────────────────────────────────────
 if (opts.prime) {
@@ -2016,6 +2468,16 @@ async function waitForUpdates(sessionId, agentId) {
 
 try {
   if (opts.command) {
+    if (opts.command === "status") {
+      const current = await daemonStatus(opts.port);
+      emit(current);
+      process.exit(current.running ? 0 : 1);
+    }
+    if (opts.command === "stop") {
+      const stopped = await stopDaemon(opts.port);
+      emit(stopped);
+      process.exit(stopped.ok ? 0 : 1);
+    }
     const session = requireSession();
     if (opts.command === "list-highlights") {
       emit(loadHighlights(session.id).map((h) => ({ id: h.id, text: h.text.slice(0, 120), commentCount: h.messages.length, status: h.completed ? "completed" : h.resolved ? "resolved" : "open", createdAt: h.createdAt })));
@@ -2053,13 +2515,20 @@ try {
     process.exit(0);
   }
 
-  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md list-highlights --session-id ID");
+  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md -o OUTPUT.html FILE.md | spotlight-md status");
+  if (opts.files.length > 1) throw new Error("exactly one Markdown file is supported per invocation");
   const inputPath = resolve(opts.files[0]);
   statSync(inputPath);
   if (opts.auto) {
-    const session = getOrCreateSession(inputPath, opts.newSession);
-    if (opts.json) console.log(JSON.stringify({ sessionId: session.id, path: session.path, resumed: session.resumed, url: `http://localhost:${opts.port}` }));
-    serveAuto(inputPath, opts, session);
+    if (opts.output) throw new Error("--auto and --output cannot be combined; use -o without --auto for a static export");
+    const registration = await registerWithDaemon(inputPath, opts);
+    if (opts.json) console.log(JSON.stringify(registration));
+    else {
+      console.log(`  spotlight-md registered ${registration.path}`);
+      console.log(`  session: ${registration.sessionId}${registration.resumed ? " (resumed)" : ""}`);
+      console.log(`  → ${registration.url}`);
+    }
+    if (opts.open) openBrowser(registration.url);
   } else {
     const outputPath = resolve(opts.output || inputPath.replace(/\.md$/i, ".html"));
     writeStatic(inputPath, outputPath);
