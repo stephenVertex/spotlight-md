@@ -170,6 +170,20 @@ test("one daemon isolates registered documents and safely encodes virtual routes
   assert.match(second.route, /%CE%B2%20notes\.html$/);
   assert.notEqual(first.url, second.url);
 
+  result = cli(["status", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  let status = JSON.parse(result.stdout);
+  assert.deepEqual(status.documents.map((document) => document.path), [resolve(secondPath), resolve(firstPath)], "new registrations are the most recent activity");
+  assert.ok(status.documents.every((document) => document.lastActivityAt), "status exposes document activity timestamps");
+
+  const secondPage = await (await fetch(second.url)).text();
+  assert.match(secondPage, /<div class="sidebar-section-title">Recent documents<\/div>/);
+  assert.ok(secondPage.includes(`<a href="${second.route}" class="recent-document-link active" aria-current="page">`), "marks the open document in the recent list");
+  assert.ok(secondPage.includes(`<a href="${first.route}" class="recent-document-link">`), "links to another registered document's virtual route");
+  assert.ok(secondPage.includes(firstPath) && secondPage.includes(secondPath), "canonical paths disambiguate recent document entries");
+  assert.equal(secondPage.includes(unregisteredPath), false, "does not expose unregistered documents in the recent list");
+  assert.ok(secondPage.indexOf(`href="${second.route}"`) < secondPage.indexOf(`href="${first.route}"`), "renders most recently active documents first");
+
   result = cli(["--auto", "--no-open", "--json", "--port", String(port), firstPath], env);
   assert.equal(result.status, 0, result.stderr);
   const resumed = JSON.parse(result.stdout);
@@ -193,13 +207,22 @@ test("one daemon isolates registered documents and safely encodes virtual routes
   assert.equal((await (await fetch(`${first.url}/__highlights__`)).json()).length, 1);
   assert.deepEqual(await (await fetch(`${second.url}/__highlights__`)).json(), [], "highlight APIs must remain document-scoped");
 
+  const linkedUrl = new URL(first.route, second.url);
+  assert.match(await (await fetch(linkedUrl)).text(), /First document passage/, "a recent entry opens the registered document route");
+  assert.equal((await (await fetch(`${linkedUrl}/__session__`)).json()).id, first.sessionId, "the linked route restores the document's active session");
+  assert.equal((await (await fetch(`${linkedUrl}/__highlights__`)).json()).length, 1, "the linked route restores access to the session's highlights");
+
+  result = cli(["status", "--port", String(port), "--json"], env);
+  status = JSON.parse(result.stdout);
+  assert.equal(status.documents[0].path, resolve(firstPath), "review and navigation activity move a document to the front");
+
   writeFileSync(firstPath, "# First\n\nReloaded first document\n");
   await waitForPageText(first.url, "Reloaded first document");
   assert.match(await (await fetch(second.url)).text(), /Second document passage/, "one document reload must not replace another document's page");
 
   result = cli(["status", "--port", String(port), "--json"], env);
   assert.equal(result.status, 0, result.stderr);
-  const status = JSON.parse(result.stdout);
+  status = JSON.parse(result.stdout);
   assert.equal(status.running, true);
   assert.equal(status.documents.length, 2);
   assert.deepEqual(new Set(status.documents.map((document) => document.path)), new Set([resolve(firstPath), resolve(secondPath)]));
