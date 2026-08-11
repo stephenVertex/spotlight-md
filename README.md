@@ -67,6 +67,8 @@ Two built-in themes: **github-dark** (default) and **dracula**. Pass `--theme dr
 
 A sticky left sidebar lists all headings (h1-h3) with scroll-spy highlighting that tracks your position in the document. Click any heading to jump to it.
 
+On the shared `--auto` server, the sidebar also lists recently active registered documents. Each entry shows its filename and canonical path; selecting one opens its registered virtual route with that document's active review session and highlights. Registrations, document visits, source edits, and highlight activity move a document to the top of the list. Files that have not been registered with the running server are never included.
+
 ### Frontmatter card
 
 If the document begins with a metadata block of `**Label:** value` lines after the H1, they are rendered as a clean label/value card at the top of the page.

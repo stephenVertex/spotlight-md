@@ -493,6 +493,58 @@ body {
   line-height: 1.4;
   word-break: break-word;
 }
+.sidebar-section-title {
+  padding: 0 20px 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.recent-documents {
+  padding: 0 8px 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.recent-document-link {
+  display: block;
+  padding: 7px 10px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+  border-radius: 6px;
+  line-height: 1.35;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.recent-document-link:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.04);
+  text-decoration: none;
+}
+.recent-document-link.active {
+  color: var(--heading);
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+}
+.recent-document-title {
+  display: block;
+  overflow: hidden;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-document-path {
+  display: block;
+  overflow: hidden;
+  margin-top: 1px;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-document-link.active .recent-document-path { color: var(--text); }
 .toc {
   padding: 0 8px;
 }
@@ -965,7 +1017,20 @@ mark.mdhtml-hl:hover {
 }
 `;
 
-function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName, documentRoute = "") {
+function buildRecentDocumentsHtml(recentDocuments, currentRoute) {
+  if (!recentDocuments.length) return "";
+  let html = '    <div class="sidebar-section-title">Recent documents</div>\n    <div class="recent-documents">\n';
+  for (const document of recentDocuments) {
+    const active = document.route === currentRoute;
+    html += `      <a href="${escapeHtml(document.route)}" class="recent-document-link${active ? " active" : ""}"${active ? ' aria-current="page"' : ""}>\n`;
+    html += `        <span class="recent-document-title">${escapeHtml(basename(document.path))}</span>\n`;
+    html += `        <span class="recent-document-path">${escapeHtml(document.path)}</span>\n`;
+    html += "      </a>\n";
+  }
+  return html + "    </div>\n";
+}
+
+function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName, documentRoute = "", recentDocuments = []) {
   const apiBase = JSON.stringify(documentRoute);
   const reloadScript = autoMode
     ? `<div id="reload-badge">Reloading…</div>
@@ -1464,11 +1529,14 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 })();
 </script>` : "";
 
-  const sidebarHtml = tocHtml ? `  <nav class="sidebar">
-    <div class="sidebar-header"><div class="doc-title">${escapeHtml(title)}</div></div>
-    <div class="toc">
+  const recentDocumentsHtml = buildRecentDocumentsHtml(recentDocuments, documentRoute);
+  const tocSectionHtml = tocHtml ? `${recentDocumentsHtml ? '    <div class="sidebar-section-title">On this page</div>\n' : ""}    <div class="toc">
 ${tocHtml}
     </div>
+` : "";
+  const sidebarHtml = tocHtml || recentDocumentsHtml ? `  <nav class="sidebar">
+    <div class="sidebar-header"><div class="doc-title">${escapeHtml(title)}</div></div>
+${recentDocumentsHtml}${tocSectionHtml}
   </nav>` : "";
 
   return `<!DOCTYPE html>
@@ -1581,7 +1649,7 @@ function sendJson(res, status, value, extraHeaders = {}) {
   res.end(JSON.stringify(value));
 }
 
-function createDocumentState(inputPath, theme, session) {
+function createDocumentState(inputPath, theme, session, onActivity) {
   const document = {
     path: inputPath,
     route: virtualDocumentRoute(inputPath),
@@ -1595,6 +1663,8 @@ function createDocumentState(inputPath, theme, session) {
     clients: [],
     debounceTimer: null,
     watcher: null,
+    lastActivityAt: null,
+    activitySequence: 0,
   };
 
   rebuildDocument(document);
@@ -1603,6 +1673,7 @@ function createDocumentState(inputPath, theme, session) {
     document.debounceTimer = setTimeout(() => {
       try {
         rebuildDocument(document);
+        onActivity(document);
         broadcastDocument(document, "reload");
       } catch (error) {
         console.error(`spotlight-md: could not re-render ${document.path}: ${error.message}`);
@@ -1633,10 +1704,11 @@ function closeDocumentState(document) {
   document.clients.length = 0;
 }
 
-async function handleDocumentRequest(document, subpath, req, res) {
+async function handleDocumentRequest(document, subpath, req, res, daemonContext) {
   if (subpath === "" && req.method === "GET") {
+    daemonContext.markActive(document);
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-    res.end(buildHtml(document.title, document.html, document.frontmatterHtml, document.tocHtml, true, document.theme, document.route));
+    res.end(buildHtml(document.title, document.html, document.frontmatterHtml, document.tocHtml, true, document.theme, document.route, daemonContext.recentDocuments()));
     return;
   }
 
@@ -1670,6 +1742,7 @@ async function handleDocumentRequest(document, subpath, req, res) {
       return;
     }
     const highlight = addHighlight(document.session.id, data);
+    daemonContext.markActive(document);
     sendJson(res, 201, highlight, { Location: `${document.route}/__highlights__/${highlight.id}` });
     broadcastDocument(document, "highlights-updated");
     return;
@@ -1681,6 +1754,7 @@ async function handleDocumentRequest(document, subpath, req, res) {
     const removed = setHighlightResolved(document.session.id, id, true, true);
     if (!removed) sendJson(res, 404, { error: "not found" });
     else {
+      daemonContext.markActive(document);
       sendJson(res, 200, { ok: true, id });
       broadcastDocument(document, "highlights-updated");
     }
@@ -1701,6 +1775,7 @@ async function handleDocumentRequest(document, subpath, req, res) {
     const result = addHighlightMessage(document.session.id, messageMatch[1], data.author || "ai", data.text.trim(), data.agentId || null);
     if (!result) sendJson(res, 404, { error: "highlight not found" });
     else {
+      daemonContext.markActive(document);
       sendJson(res, 200, result);
       broadcastDocument(document, "highlights-updated");
     }
@@ -1712,6 +1787,7 @@ async function handleDocumentRequest(document, subpath, req, res) {
     const highlight = setHighlightResolved(document.session.id, resolvedMatch[1], resolvedMatch[2] === "resolve");
     if (!highlight) sendJson(res, 404, { error: "not found" });
     else {
+      daemonContext.markActive(document);
       sendJson(res, 200, highlight);
       broadcastDocument(document, "highlights-updated");
     }
@@ -1733,7 +1809,26 @@ function serveDaemon(daemonOpts) {
   const documentsByRoute = new Map();
   const documentsByPath = new Map();
   const startedAt = new Date().toISOString();
+  let activitySequence = 0;
   let shuttingDown = false;
+
+  function markActive(document) {
+    document.activitySequence = ++activitySequence;
+    document.lastActivityAt = new Date().toISOString();
+  }
+
+  function recentDocuments() {
+    return [...documentsByPath.values()]
+      .sort((left, right) => right.activitySequence - left.activitySequence)
+      .map((document) => ({
+        path: document.path,
+        route: document.route,
+        sessionId: document.session.id,
+        lastActivityAt: document.lastActivityAt,
+      }));
+  }
+
+  const daemonContext = { markActive, recentDocuments };
 
   function isAuthorized(req) {
     return req.headers["x-spotlight-token"] === token;
@@ -1747,11 +1842,7 @@ function serveDaemon(daemonOpts) {
       pid: process.pid,
       port: daemonOpts.port,
       startedAt,
-      documents: [...documentsByPath.values()].map((document) => ({
-        path: document.path,
-        route: document.route,
-        sessionId: document.session.id,
-      })),
+      documents: recentDocuments(),
     };
   }
 
@@ -1792,12 +1883,14 @@ function serveDaemon(daemonOpts) {
           document.theme = registration.theme || "github-dark";
           document.session = session;
           rebuildDocument(document);
+          markActive(document);
           broadcastDocument(document, "reload");
         } else {
-          document = createDocumentState(canonicalPath, registration.theme || "github-dark", session);
+          document = createDocumentState(canonicalPath, registration.theme || "github-dark", session, markActive);
           if (documentsByRoute.has(document.route)) throw new Error("document route collision");
           documentsByPath.set(canonicalPath, document);
           documentsByRoute.set(document.route, document);
+          markActive(document);
         }
         sendJson(res, 200, {
           sessionId: session.id,
@@ -1833,7 +1926,7 @@ function serveDaemon(daemonOpts) {
         sendJson(res, 404, { error: "document is not registered" });
         return;
       }
-      await handleDocumentRequest(matchedDocument, subpath, req, res);
+      await handleDocumentRequest(matchedDocument, subpath, req, res, daemonContext);
     } catch (error) {
       if (!res.headersSent) sendJson(res, error instanceof URIError ? 400 : 500, { error: error.message });
       else res.end();
