@@ -250,6 +250,43 @@ test("selection popup submit handler receives its event instead of referencing a
   );
 });
 
+test("live review pages include a dismissible first-run collaboration guide", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-guide-"));
+  const inputPath = join(dir, "guide.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  writeFileSync(inputPath, "# Guide\n\nA passage to review.\n");
+
+  const auto = cli(["--auto", "--no-open", "--json", "--port", String(port), inputPath], env);
+  assert.equal(auto.status, 0, auto.stderr);
+  const { url } = JSON.parse(auto.stdout);
+
+  t.after(async () => {
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  await waitForServer(url);
+  const page = await (await fetch(url)).text();
+
+  assert.match(page, /id="spotlight-guide"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.equal((page.match(/class="spotlight-guide-step"/g) || []).length, 5);
+  assert.match(page, /Select text/);
+  assert.match(page, /optional note/i);
+  assert.match(page, /Submit the highlight/);
+  assert.match(page, /right-side thread/);
+  assert.match(page, /AI agent/);
+  assert.match(page, /sessions preserve[^<]*review and audit trail/i);
+  assert.match(page, /id="spotlight-guide-dismiss"[^>]*>Got it<\/button>/);
+  assert.match(page, /id="spotlight-guide-open"[^>]*>Guide<\/button>/);
+  assert.match(page, /spotlight-md\.guide\.v1\.dismissed/);
+  assert.match(page, /localStorage\.getItem\(guideStorageKey\)/);
+  assert.match(page, /localStorage\.setItem\(guideStorageKey, '1'\)/);
+  assert.match(page, /if \(e\.key === 'Escape' && !guide\.hidden\)/);
+});
+
 test("prime teaches agents the session-based collaborative review loop", () => {
   const result = cli(["prime"], {});
   assert.equal(result.status, 0, result.stderr);
