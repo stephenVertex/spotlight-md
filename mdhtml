@@ -22,7 +22,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
-    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
+    else if (["status", "stop", "list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
     else if (a === "--daemon") opts.daemon = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
@@ -49,6 +49,9 @@ function parseArgs(argv) {
 
 Usage:
   spotlight-md --auto [--json] [--new-session] FILE.md
+  spotlight-md status [--port NUM] [--json]
+  spotlight-md stop [--port NUM] [--json]
+  spotlight-md -o OUTPUT.html FILE.md
   spotlight-md list-highlights --session-id ID [--json]
   spotlight-md get-highlight-details --session-id ID --highlight-id ID [--json]
   spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--json]
@@ -59,7 +62,9 @@ Usage:
   spotlight-md reopen-session --session-id ID
 
 Sessions and annotations live in ~/.config/spotlight-md/global-highlights-db.db.
---auto resumes the document's active session unless --new-session is set.
+--auto launches or reuses the local daemon on port 7231, registers the document,
+and resumes its active session unless --new-session is set. It does not write an
+HTML file; use -o for a static export.
 Use --json for stable machine-readable output.`);
       process.exit(0);
     } else if (a.startsWith("-")) {
@@ -1863,6 +1868,122 @@ function serveDaemon(daemonOpts) {
   process.on("SIGTERM", shutdown);
 }
 
+function readDaemonState(port) {
+  try {
+    const state = JSON.parse(readFileSync(daemonStatePath(port), "utf8"));
+    if (state.port !== port || !Number.isInteger(state.pid) || typeof state.token !== "string") return null;
+    return state;
+  } catch {
+    return null;
+  }
+}
+
+function removeStaleDaemonState(port) {
+  try { unlinkSync(daemonStatePath(port)); }
+  catch { /* A missing state file is already clean. */ }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 1000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeDaemon(port) {
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/__spotlight__/health`);
+    const body = await response.json().catch(() => null);
+    return body && body.service === "spotlight-md" ? "running" : "occupied";
+  } catch {
+    return "stopped";
+  }
+}
+
+async function daemonRequest(port, state, pathname, method = "GET", body = undefined) {
+  const response = await fetchWithTimeout(`http://127.0.0.1:${port}${pathname}`, {
+    method,
+    headers: {
+      "X-Spotlight-Token": state.token,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }, 5000);
+  const value = await response.json().catch(() => ({ error: `daemon returned HTTP ${response.status}` }));
+  if (!response.ok) throw new Error(value.error || `daemon returned HTTP ${response.status}`);
+  return value;
+}
+
+async function ensureDaemon(port) {
+  const initialProbe = await probeDaemon(port);
+  if (initialProbe === "running") {
+    const state = readDaemonState(port);
+    if (!state) throw new Error(`daemon is running on port ${port}, but its control file is unavailable`);
+    await daemonRequest(port, state, "/__spotlight__/status");
+    return state;
+  }
+  if (initialProbe === "occupied") throw new Error(`port ${port} is already used by another service`);
+
+  removeStaleDaemonState(port);
+  const token = randomBytes(24).toString("hex");
+  const child = spawn(process.execPath, [resolve(process.argv[1]), "--daemon", "--port", String(port)], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, SPOTLIGHT_MD_DAEMON_TOKEN: token },
+  });
+  child.on("error", () => {});
+  child.unref();
+
+  for (let attempt = 0; attempt < 60; attempt++) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    const probe = await probeDaemon(port);
+    if (probe === "occupied") throw new Error(`port ${port} became occupied by another service`);
+    if (probe === "running") {
+      const state = readDaemonState(port);
+      if (state && state.token === token) return state;
+    }
+  }
+  throw new Error(`timed out starting daemon on port ${port}`);
+}
+
+function openBrowser(url) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { stdio: "ignore", detached: true });
+  child.on("error", () => {});
+  child.unref();
+}
+
+async function registerWithDaemon(inputPath, registrationOpts) {
+  const state = await ensureDaemon(registrationOpts.port);
+  return daemonRequest(registrationOpts.port, state, "/__spotlight__/register", "POST", {
+    path: inputPath,
+    theme: registrationOpts.theme,
+    newSession: registrationOpts.newSession,
+  });
+}
+
+async function daemonStatus(port) {
+  const probe = await probeDaemon(port);
+  if (probe !== "running") {
+    if (probe === "stopped") removeStaleDaemonState(port);
+    return { service: "spotlight-md", running: false, port, reason: probe === "occupied" ? "port occupied by another service" : undefined };
+  }
+  const state = readDaemonState(port);
+  if (!state) throw new Error(`daemon is running on port ${port}, but its control file is unavailable`);
+  return daemonRequest(port, state, "/__spotlight__/status");
+}
+
+async function stopDaemon(port) {
+  const current = await daemonStatus(port);
+  if (!current.running) return { ok: false, running: false, port };
+  const state = readDaemonState(port);
+  return daemonRequest(port, state, "/__spotlight__/stop", "POST");
+}
+
 function serveAuto(inputPath, opts, session) {
   const report = opts.json ? console.error : console.log;
   let currentHtml = "";
@@ -1887,15 +2008,6 @@ function serveAuto(inputPath, opts, session) {
   }
 
   rebuild();
-
-  // Also write a static file alongside
-  const outputPath = opts.output || inputPath.replace(/\.md$/i, ".html");
-  function writeStaticCopy() {
-    try {
-      writeFileSync(outputPath, buildHtml(currentTitle, currentHtml, currentFrontmatter, currentToc, false, opts.theme));
-    } catch (e) { /* ignore */ }
-  }
-  writeStaticCopy();
 
   function broadcastHighlights() {
     for (const client of sseClients) {
@@ -2084,7 +2196,6 @@ function serveAuto(inputPath, opts, session) {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       rebuild();
-      writeStaticCopy();
       // Notify all connected browsers
       for (const client of sseClients) {
         client.write("event: reload\ndata: {}\n\n");
@@ -2105,6 +2216,11 @@ function serveAuto(inputPath, opts, session) {
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 const opts = parseArgs(process.argv.slice(2));
+
+if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+  console.error("spotlight-md: --port must be an integer between 1 and 65535");
+  process.exit(1);
+}
 
 if (opts.daemon) {
   serveDaemon(opts);
@@ -2347,6 +2463,16 @@ async function waitForUpdates(sessionId, agentId) {
 
 try {
   if (opts.command) {
+    if (opts.command === "status") {
+      const current = await daemonStatus(opts.port);
+      emit(current);
+      process.exit(current.running ? 0 : 1);
+    }
+    if (opts.command === "stop") {
+      const stopped = await stopDaemon(opts.port);
+      emit(stopped);
+      process.exit(stopped.ok ? 0 : 1);
+    }
     const session = requireSession();
     if (opts.command === "list-highlights") {
       emit(loadHighlights(session.id).map((h) => ({ id: h.id, text: h.text.slice(0, 120), commentCount: h.messages.length, status: h.completed ? "completed" : h.resolved ? "resolved" : "open", createdAt: h.createdAt })));
@@ -2384,13 +2510,20 @@ try {
     process.exit(0);
   }
 
-  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md list-highlights --session-id ID");
+  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md -o OUTPUT.html FILE.md | spotlight-md status");
+  if (opts.files.length > 1) throw new Error("exactly one Markdown file is supported per invocation");
   const inputPath = resolve(opts.files[0]);
   statSync(inputPath);
   if (opts.auto) {
-    const session = getOrCreateSession(inputPath, opts.newSession);
-    if (opts.json) console.log(JSON.stringify({ sessionId: session.id, path: session.path, resumed: session.resumed, url: `http://localhost:${opts.port}` }));
-    serveAuto(inputPath, opts, session);
+    if (opts.output) throw new Error("--auto and --output cannot be combined; use -o without --auto for a static export");
+    const registration = await registerWithDaemon(inputPath, opts);
+    if (opts.json) console.log(JSON.stringify(registration));
+    else {
+      console.log(`  spotlight-md registered ${registration.path}`);
+      console.log(`  session: ${registration.sessionId}${registration.resumed ? " (resumed)" : ""}`);
+      console.log(`  → ${registration.url}`);
+    }
+    if (opts.open) openBrowser(registration.url);
   } else {
     const outputPath = resolve(opts.output || inputPath.replace(/\.md$/i, ".html"));
     writeStatic(inputPath, outputPath);
