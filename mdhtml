@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // mdhtml — render markdown to a dark-themed HTML page with optional live reload.
 //   mdhtml file.md              → writes file.html
-//   mdhtml --auto file.md       → serves + watches + live-reloads in browser
+//   mdhtml --auto file.md       → registers with daemon + opens live browser view
 //   mdhtml -o out.html file.md  → specify output path
 //   mdhtml --port 4040 --auto file.md
 // Zero dependencies. Node 18+.
@@ -1943,7 +1943,12 @@ async function ensureDaemon(port) {
     if (probe === "occupied") throw new Error(`port ${port} became occupied by another service`);
     if (probe === "running") {
       const state = readDaemonState(port);
-      if (state && state.token === token) return state;
+      if (state) {
+        try {
+          await daemonRequest(port, state, "/__spotlight__/status");
+          return state;
+        } catch { /* The winning daemon may still be publishing its control state. */ }
+      }
     }
   }
   throw new Error(`timed out starting daemon on port ${port}`);

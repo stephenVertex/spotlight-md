@@ -22,11 +22,8 @@ async function unusedPort() {
   return port;
 }
 
-async function waitForServer(url, child) {
+async function waitForServer(url) {
   for (let attempt = 0; attempt < 50; attempt++) {
-    if (child.exitCode !== null) {
-      throw new Error(`spotlight-md exited before serving (${child.exitCode})`);
-    }
     try {
       const response = await fetch(`${url}/__highlights__`);
       if (response.ok) return;
@@ -38,11 +35,17 @@ async function waitForServer(url, child) {
   throw new Error("timed out waiting for spotlight-md to serve highlights");
 }
 
-async function stop(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = once(child, "exit");
-  child.kill("SIGTERM");
-  await exited;
+async function waitForPageText(url, expected) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const response = await fetch(url);
+    if (response.ok && (await response.text()).includes(expected)) return;
+    await sleep(50);
+  }
+  throw new Error(`timed out waiting for rendered page to contain ${expected}`);
+}
+
+function virtualRoute(inputPath) {
+  return "/spotlight/" + inputPath.replace(/\.md$/i, ".html").split("/").filter(Boolean).map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
 }
 
 function cli(args, env) {
@@ -64,20 +67,20 @@ test("global service sessions support agent cursors, completion, and close summa
   const configDir = join(dir, "config");
   const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
   const port = await unusedPort();
-  const url = `http://127.0.0.1:${port}`;
   writeFileSync(inputPath, "# Audit\n\nSelected audit passage\n");
 
-  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
-    stdio: "ignore",
-    env: { ...process.env, ...env },
-  });
+  const auto = cli(["--auto", "--no-open", "--json", "--port", String(port), inputPath], env);
+  assert.equal(auto.status, 0, auto.stderr);
+  const registration = JSON.parse(auto.stdout);
+  const url = registration.url;
 
   t.after(async () => {
-    await stop(child);
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
     rmSync(dir, { recursive: true, force: true });
   });
 
-  await waitForServer(url, child);
+  await waitForServer(url);
   const createResponse = await fetch(`${url}/__highlights__`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -136,6 +139,80 @@ test("global service sessions support agent cursors, completion, and close summa
   assert.match(result.stdout, /Completed as requested/);
 });
 
+test("one daemon isolates registered documents and safely encodes virtual routes", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-daemon-"));
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  const firstPath = join(dir, "alpha #100%.md");
+  const secondPath = join(dir, "β notes.md");
+  const unregisteredPath = join(dir, "private # notes.md");
+  writeFileSync(firstPath, "# First\n\nFirst document passage\n");
+  writeFileSync(secondPath, "# Second\n\nSecond document passage\n");
+  writeFileSync(unregisteredPath, "# Private\n\nMust not be served\n");
+
+  t.after(async () => {
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  let result = cli(["--auto", "--no-open", "--json", "--port", String(port), firstPath], env);
+  assert.equal(result.status, 0, result.stderr);
+  const first = JSON.parse(result.stdout);
+  assert.equal(first.route, virtualRoute(firstPath));
+  assert.match(first.route, /alpha%20%23100%25\.html$/);
+
+  result = cli(["--auto", "--no-open", "--json", "--port", String(port), secondPath], env);
+  assert.equal(result.status, 0, result.stderr);
+  const second = JSON.parse(result.stdout);
+  assert.equal(second.route, virtualRoute(secondPath));
+  assert.match(second.route, /%CE%B2%20notes\.html$/);
+  assert.notEqual(first.url, second.url);
+
+  result = cli(["--auto", "--no-open", "--json", "--port", String(port), firstPath], env);
+  assert.equal(result.status, 0, result.stderr);
+  const resumed = JSON.parse(result.stdout);
+  assert.equal(resumed.sessionId, first.sessionId);
+  assert.equal(resumed.resumed, true);
+
+  assert.equal(existsSync(firstPath.replace(/\.md$/i, ".html")), false, "auto mode must not write a neighboring HTML file");
+  assert.equal(existsSync(secondPath.replace(/\.md$/i, ".html")), false, "auto mode must not write a neighboring HTML file");
+
+  assert.match(await (await fetch(first.url)).text(), /First document passage/);
+  assert.match(await (await fetch(second.url)).text(), /Second document passage/);
+  const hiddenResponse = await fetch(`http://127.0.0.1:${port}${virtualRoute(unregisteredPath)}`);
+  assert.equal(hiddenResponse.status, 404, "a real but unregistered path must not be readable through a virtual route");
+
+  const created = await fetch(`${first.url}/__highlights__`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "First document passage" }),
+  });
+  assert.equal(created.status, 201);
+  assert.equal((await (await fetch(`${first.url}/__highlights__`)).json()).length, 1);
+  assert.deepEqual(await (await fetch(`${second.url}/__highlights__`)).json(), [], "highlight APIs must remain document-scoped");
+
+  writeFileSync(firstPath, "# First\n\nReloaded first document\n");
+  await waitForPageText(first.url, "Reloaded first document");
+  assert.match(await (await fetch(second.url)).text(), /Second document passage/, "one document reload must not replace another document's page");
+
+  result = cli(["status", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  const status = JSON.parse(result.stdout);
+  assert.equal(status.running, true);
+  assert.equal(status.documents.length, 2);
+  assert.deepEqual(new Set(status.documents.map((document) => document.path)), new Set([resolve(firstPath), resolve(secondPath)]));
+
+  result = cli(["stop", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).ok, true);
+  await sleep(100);
+  result = cli(["status", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(result.stdout).running, false);
+});
+
 test("selection popup submit handler receives its event instead of referencing an undeclared variable", () => {
   const source = readFileSync(toolPath, "utf8");
   assert.equal(
@@ -162,7 +239,7 @@ test("prime teaches agents the session-based collaborative review loop", () => {
 test("reports the semantic version from the release source of truth", () => {
   const result = cli(["--version"], {});
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "spotlight-md 0.1.1");
+  assert.equal(result.stdout.trim(), "spotlight-md 0.2.0");
 });
 
 test("rendered pages include a fixed spotlight-md version badge", () => {
