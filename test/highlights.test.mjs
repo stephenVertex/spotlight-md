@@ -158,3 +158,9 @@ test("prime teaches agents the session-based collaborative review loop", () => {
   assert.match(result.stdout, /close-session --session-id/);
   assert.match(result.stdout, /Do not complete a highlight merely because you replied/);
 });
+
+test("reports the semantic version from the release source of truth", () => {
+  const result = cli(["--version"], {});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "spotlight-md 0.1.1");
+});

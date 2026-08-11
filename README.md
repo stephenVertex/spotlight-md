@@ -1,5 +1,7 @@
 # spotlight-md
 
+Version: **0.1.1**
+
 Dark-themed markdown viewer with live reload, sidebar TOC, and highlight annotations for AI-assisted document review.
 
 ## Install
@@ -7,6 +9,7 @@ Dark-themed markdown viewer with live reload, sidebar TOC, and highlight annotat
 `mdhtml` and `spotlight-md` are the same tool (symlinked). Put both on your PATH.
 
 Requires [Node.js](https://nodejs.org/) 18+ and [pandoc](https://pandoc.org/).
+Releases follow [Semantic Versioning](https://semver.org/); see [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
@@ -32,6 +35,7 @@ spotlight-md get-new-comments --session-id sp-… --agent-id codex-… --wait --
 spotlight-md add-comment --session-id sp-… --highlight-id hl-… --agent-id codex-… --comment "Addressed it"
 spotlight-md ai-agent-mark-as-completed --session-id sp-… --highlight-id hl-… --comment "Completed"
 spotlight-md close-session --session-id sp-…
+spotlight-md --version
 ```
 
 ## Options

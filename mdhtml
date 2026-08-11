@@ -14,6 +14,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
+const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim();
+
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
@@ -37,6 +39,10 @@ function parseArgs(argv) {
     else if (a === "--wait") opts.wait = true;
     else if (a === "--json") opts.json = true;
     else if (a === "--new-session") opts.newSession = true;
+    else if (a === "--version" || a === "-V") {
+      console.log(`spotlight-md ${VERSION}`);
+      process.exit(0);
+    }
     else if (a === "--help" || a === "-h") {
       console.log(`spotlight-md — Markdown review service
 
