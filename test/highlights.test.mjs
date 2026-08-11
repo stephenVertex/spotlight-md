@@ -164,3 +164,10 @@ test("reports the semantic version from the release source of truth", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), "spotlight-md 0.1.1");
 });
+
+test("rendered pages include a fixed spotlight-md version badge", () => {
+  const source = readFileSync(toolPath, "utf8");
+  assert.match(source, /class="spotlight-brand"/);
+  assert.match(source, /spotlight-md <span>v\$\{escapeHtml\(VERSION\)\}/);
+  assert.match(source, /\.spotlight-brand \{\s*position: fixed;/);
+});
