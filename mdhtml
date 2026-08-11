@@ -1515,6 +1515,7 @@ function writeStatic(inputPath, outputPath) {
 }
 
 function serveAuto(inputPath, opts, session) {
+  const report = opts.json ? console.error : console.log;
   let currentHtml = "";
   let currentTitle = "";
   let currentFrontmatter = "";
@@ -1530,7 +1531,7 @@ function serveAuto(inputPath, opts, session) {
       currentFrontmatter = frontmatterHtml;
       currentToc = tocHtml;
       mtime = statSync(inputPath).mtimeMs;
-      console.log(`  [${new Date().toLocaleTimeString()}] rendered ${inputPath}`);
+      report(`  [${new Date().toLocaleTimeString()}] rendered ${inputPath}`);
     } catch (e) {
       console.error("  render error:", e.message);
     }
@@ -1718,9 +1719,9 @@ function serveAuto(inputPath, opts, session) {
 
   server.listen(opts.port, () => {
     const url = `http://localhost:${opts.port}`;
-    console.log(`\n  spotlight-md serving ${inputPath}`);
-    console.log(`  session: ${session.id}${session.resumed ? " (resumed)" : ""}`);
-    console.log(`  → ${url}\n`);
+    report(`\n  spotlight-md serving ${inputPath}`);
+    report(`  session: ${session.id}${session.resumed ? " (resumed)" : ""}`);
+    report(`  → ${url}\n`);
     if (opts.open) {
       try {
         spawn("open", [url], { stdio: "ignore", detached: true }).unref();
@@ -1742,13 +1743,13 @@ function serveAuto(inputPath, opts, session) {
     }, 150);
   });
 
-  console.log("  watching for changes…  (Ctrl-C to stop)\n");
+  report("  watching for changes…  (Ctrl-C to stop)\n");
 
   process.on("SIGINT", () => {
     unwatchFile(inputPath);
     for (const c of sseClients) c.end();
     server.close();
-    console.log("\n  stopped.");
+    report("\n  stopped.");
     process.exit(0);
   });
 }
