@@ -1653,7 +1653,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   // -- Events --
   document.addEventListener('mouseup', function(e){
-    if (e.target.closest('.hl-popup, .hl-delete-popup, .sidebar')) return;
+    if (e.target.closest('.hl-popup, .hl-delete-popup, .sidebar, .spotlight-guide')) return;
     setTimeout(function(){
       var selection = selectedHighlightData();
       removeSelPopup();
@@ -1691,6 +1691,63 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   // -- Initial load --
   loadAndApply();
+})();
+</script>` : "";
+
+  const guideScript = autoMode ? `
+<script>
+(function(){
+  var guide = document.getElementById('spotlight-guide');
+  var openButton = document.getElementById('spotlight-guide-open');
+  var closeButton = document.getElementById('spotlight-guide-close');
+  var dismissButton = document.getElementById('spotlight-guide-dismiss');
+  var guideStorageKey = 'spotlight-md.guide.v1.dismissed';
+  var lastFocused = null;
+  if (!guide || !openButton || !closeButton || !dismissButton) return;
+
+  function wasDismissed() {
+    try { return localStorage.getItem(guideStorageKey) === '1'; }
+    catch (error) { return false; }
+  }
+
+  function openGuide() {
+    lastFocused = document.activeElement;
+    guide.hidden = false;
+    document.body.classList.add('spotlight-guide-opened');
+    dismissButton.focus();
+  }
+
+  function dismissGuide() {
+    guide.hidden = true;
+    document.body.classList.remove('spotlight-guide-opened');
+    try { localStorage.setItem(guideStorageKey, '1'); }
+    catch (error) {}
+    if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus();
+  }
+
+  openButton.addEventListener('click', openGuide);
+  closeButton.addEventListener('click', dismissGuide);
+  dismissButton.addEventListener('click', dismissGuide);
+  guide.addEventListener('click', function(e) {
+    if (e.target === guide) dismissGuide();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && !guide.hidden) {
+      e.preventDefault();
+      dismissGuide();
+      return;
+    }
+    if (e.key !== 'Tab' || guide.hidden) return;
+    if (e.shiftKey && document.activeElement === closeButton) {
+      e.preventDefault();
+      dismissButton.focus();
+    } else if (!e.shiftKey && document.activeElement === dismissButton) {
+      e.preventDefault();
+      closeButton.focus();
+    }
+  });
+
+  if (!wasDismissed()) openGuide();
 })();
 </script>` : "";
 
@@ -1749,6 +1806,7 @@ ${reloadScript}
 ${scrollSpy}
 ${highlightScript}
 ${guideHtml}
+${guideScript}
 <div class="spotlight-brand" aria-label="spotlight-md version ${escapeHtml(VERSION)}">spotlight-md <span>v${escapeHtml(VERSION)}</span></div>
 </body>
 </html>`;
