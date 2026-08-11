@@ -6,8 +6,9 @@
 //   mdhtml --port 4040 --auto file.md
 // Zero dependencies. Node 18+.
 
-import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync } from "node:fs";
 import { resolve, dirname, basename, extname, join } from "node:path";
+import { homedir } from "node:os";
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -15,53 +16,44 @@ import { DatabaseSync } from "node:sqlite";
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", listHighlights: false, needsAttention: false, deleteHighlight: null, clearHighlights: false, addComment: null, commentText: null, addReply: null, replyText: null, resolveHighlight: null, unresolveHighlight: null, prime: false, files: [] };
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
+    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
     else if (a === "--no-open") opts.open = false;
     else if (a === "--theme" || a === "-t") opts.theme = argv[++i];
-    else if (a === "--list-highlights") opts.listHighlights = true;
-    else if (a === "--needs-attention") opts.needsAttention = true;
-    else if (a === "--delete-highlight") opts.deleteHighlight = argv[++i];
-    else if (a === "--clear-highlights") opts.clearHighlights = true;
-    else if (a === "--add-comment") opts.addComment = argv[++i];
-    else if (a === "--comment-text") opts.commentText = argv[++i];
-    else if (a === "--add-reply") opts.addReply = argv[++i];
-    else if (a === "--reply-text") opts.replyText = argv[++i];
-    else if (a === "--resolve-highlight") opts.resolveHighlight = argv[++i];
-    else if (a === "--unresolve-highlight") opts.unresolveHighlight = argv[++i];
+    else if (a === "--session-id") opts.sessionId = argv[++i];
+    else if (a.startsWith("--session-id=")) opts.sessionId = a.slice(13);
+    else if (a === "--highlight-id") opts.highlightId = argv[++i];
+    else if (a.startsWith("--highlight-id=")) opts.highlightId = a.slice(15);
+    else if (a === "--agent-id") opts.agentId = argv[++i];
+    else if (a.startsWith("--agent-id=")) opts.agentId = a.slice(11);
+    else if (a === "--comment") opts.comment = argv[++i];
+    else if (a.startsWith("--comment=")) opts.comment = a.slice(10);
+    else if (a === "--wait") opts.wait = true;
+    else if (a === "--json") opts.json = true;
+    else if (a === "--new-session") opts.newSession = true;
     else if (a === "--help" || a === "-h") {
-      console.log(`mdhtml — markdown → dark HTML with live reload
+      console.log(`spotlight-md — Markdown review service
 
 Usage:
-  mdhtml file.md                Write file.html
-  mdhtml --auto file.md         Serve, watch, and live-reload in browser
-  mdhtml -o out.html file.md    Specify output path
-  mdhtml --port 4040 --auto file.md
-  mdhtml --no-open --auto file.md   Don't auto-open browser
+  spotlight-md --auto [--json] [--new-session] FILE.md
+  spotlight-md list-highlights --session-id ID [--json]
+  spotlight-md get-highlight-details --session-id ID --highlight-id ID [--json]
+  spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--json]
+  spotlight-md ai-agent-mark-read --session-id ID --highlight-id ID --agent-id ID
+  spotlight-md add-comment --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
+  spotlight-md ai-agent-mark-as-completed --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
+  spotlight-md close-session --session-id ID
+  spotlight-md reopen-session --session-id ID
 
-Options:
-  --auto, -a        Start local server + watch for live reload
-  --port, -p NUM    Server port (default 7231)
-  --output, -o PATH Output file path (default: <input>.html)
-  --no-open         Don't open browser automatically
-  --theme, -t NAME  Color scheme: github-dark (default) or dracula
-  --list-highlights List all highlights for the file
-  --needs-attention List only highlights needing AI action (last msg from human, not resolved)
-  --delete-highlight ID  Delete a highlight by its ID
-  --clear-highlights Remove all highlights for the file
-  --add-comment ID   Add an AI comment to a highlight (requires --comment-text)
-  --comment-text TXT The comment text to add (used with --add-comment)
-  --add-reply ID     Add a human reply to a highlight (requires --reply-text)
-  --reply-text TXT   The reply text to add (used with --add-reply)
-  --resolve-highlight ID    Mark a highlight as resolved
-  --unresolve-highlight ID  Reopen a resolved highlight
-  prime              Print instructions for AI agents on how to use this tool
-  -h, --help        Show this help`);
+Sessions and annotations live in ~/.config/spotlight-md/global-highlights-db.db.
+--auto resumes the document's active session unless --new-session is set.
+Use --json for stable machine-readable output.`);
       process.exit(0);
     } else if (a.startsWith("-")) {
       console.error(`Unknown option: ${a}`);
@@ -74,25 +66,26 @@ Options:
 }
 
 // ── Highlight storage (SQLite) ─────────────────────────────────────────────
-function dbFilePath(inputPath) {
-  const canonicalPath = `${inputPath}.highlights.db`;
-  const legacyPath = inputPath.replace(/\.md$/i, ".highlights.db");
-  // SQLite sidecars originally dropped the .md suffix. Keep using an
-  // existing legacy sidecar so upgrading does not hide prior highlights.
-  if (canonicalPath !== legacyPath && !existsSync(canonicalPath) && existsSync(legacyPath)) {
-    return legacyPath;
-  }
-  return canonicalPath;
+function dbFilePath() {
+  const configDir = process.env.SPOTLIGHT_MD_CONFIG_DIR || join(homedir(), ".config", "spotlight-md");
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  return join(configDir, "global-highlights-db.db");
 }
 
-function openDb(inputPath) {
-  const dbPath = dbFilePath(inputPath);
+function openDb() {
+  const dbPath = dbFilePath();
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY, document_path TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active',
+      initial_content TEXT NOT NULL, created_at TEXT NOT NULL, closed_at TEXT, close_summary TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_document_active ON sessions(document_path, state, created_at);
     CREATE TABLE IF NOT EXISTS highlights (
       id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
       text TEXT NOT NULL,
       section_id TEXT,
       section_title TEXT,
@@ -105,26 +98,64 @@ function openDb(inputPath) {
       id TEXT PRIMARY KEY,
       highlight_id TEXT NOT NULL,
       author TEXT NOT NULL,
+      agent_id TEXT,
       text TEXT NOT NULL,
       created_at TEXT NOT NULL,
       seq INTEGER NOT NULL,
       FOREIGN KEY (highlight_id) REFERENCES highlights(id)
     );
     CREATE INDEX IF NOT EXISTS idx_messages_highlight ON messages(highlight_id, seq);
+    CREATE TABLE IF NOT EXISTS agent_reads (
+      session_id TEXT NOT NULL, agent_id TEXT NOT NULL, highlight_id TEXT NOT NULL,
+      last_read_seq INTEGER NOT NULL DEFAULT -1, read_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, agent_id, highlight_id)
+    );
   `);
   return db;
 }
 
-function loadHighlights(inputPath) {
-  const db = openDb(inputPath);
+function genId(prefix) { return prefix + randomBytes(5).toString("hex"); }
+
+function getOrCreateSession(inputPath, newSession = false) {
+  const canonical = resolve(inputPath);
+  const db = openDb();
+  try {
+    if (!newSession) {
+      const existing = db.prepare("SELECT id, document_path, state, created_at FROM sessions WHERE document_path = ? AND state = 'active' ORDER BY created_at DESC LIMIT 1").get(canonical);
+      if (existing) return { id: existing.id, path: existing.document_path, state: existing.state, createdAt: existing.created_at, resumed: true };
+    }
+    const id = genId("sp-");
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO sessions (id, document_path, initial_content, created_at) VALUES (?, ?, ?, ?)").run(id, canonical, readFileSync(canonical, "utf8"), now);
+    return { id, path: canonical, state: "active", createdAt: now, resumed: false };
+  } finally { db.close(); }
+}
+
+function getSession(sessionId) {
+  const db = openDb();
+  try {
+    const row = db.prepare("SELECT id, document_path, state, initial_content, created_at, closed_at, close_summary FROM sessions WHERE id = ?").get(sessionId);
+    return row ? { id: row.id, path: row.document_path, state: row.state, initialContent: row.initial_content, createdAt: row.created_at, closedAt: row.closed_at, closeSummary: row.close_summary } : null;
+  } finally { db.close(); }
+}
+
+function requireActiveSession(sessionId) {
+  const session = getSession(sessionId);
+  if (!session) throw new Error(`session ${sessionId} not found`);
+  if (session.state !== "active") throw new Error(`session ${sessionId} is closed; reopen it before changing highlights`);
+  return session;
+}
+
+function loadHighlights(sessionId) {
+  const db = openDb();
   try {
     const rows = db.prepare(`
       SELECT id, text, section_id, section_title, resolved, completed, created_at, completed_at
-      FROM highlights ORDER BY created_at
-    `).all();
+      FROM highlights WHERE session_id = ? ORDER BY created_at
+    `).all(sessionId);
     return rows.map((r) => {
       const msgs = db.prepare(`
-        SELECT id, author, text, created_at FROM messages
+        SELECT id, author, agent_id, text, created_at, seq FROM messages
         WHERE highlight_id = ? ORDER BY seq
       `).all(r.id);
       return {
@@ -136,7 +167,7 @@ function loadHighlights(inputPath) {
         completed: !!r.completed,
         createdAt: r.created_at,
         completedAt: r.completed_at || undefined,
-        messages: msgs.map((m) => ({ id: m.id, author: m.author, text: m.text, createdAt: m.created_at })),
+        messages: msgs.map((m) => ({ id: m.id, author: m.author, agentId: m.agent_id || undefined, text: m.text, createdAt: m.created_at, seq: m.seq })),
       };
     });
   } finally {
@@ -144,19 +175,16 @@ function loadHighlights(inputPath) {
   }
 }
 
-function genHighlightId() {
-  return "hl-" + randomBytes(3).toString("hex");
-}
-
-function addHighlight(inputPath, data) {
-  const db = openDb(inputPath);
+function addHighlight(sessionId, data) {
+  requireActiveSession(sessionId);
+  const db = openDb();
   try {
-    const id = genHighlightId();
+    const id = genId("hl-");
     const now = new Date().toISOString();
     db.prepare(`
-      INSERT INTO highlights (id, text, section_id, section_title, resolved, completed, created_at)
-      VALUES (?, ?, ?, ?, 0, 0, ?)
-    `).run(id, data.text, data.sectionId || null, data.sectionTitle || null, now);
+      INSERT INTO highlights (id, session_id, text, section_id, section_title, resolved, completed, created_at)
+      VALUES (?, ?, ?, ?, ?, 0, 0, ?)
+    `).run(id, sessionId, data.text, data.sectionId || null, data.sectionTitle || null, now);
     let messages = [];
     if (data.note) {
       const msgId = "msg-" + randomBytes(3).toString("hex");
@@ -164,7 +192,7 @@ function addHighlight(inputPath, data) {
         INSERT INTO messages (id, highlight_id, author, text, created_at, seq)
         VALUES (?, ?, 'human', ?, ?, 0)
       `).run(msgId, id, data.note, now);
-      messages = [{ id: msgId, author: "human", text: data.note, createdAt: now }];
+      messages = [{ id: msgId, author: "human", text: data.note, createdAt: now, seq: 0 }];
     }
     return { id, text: data.text, sectionId: data.sectionId, sectionTitle: data.sectionTitle, resolved: false, completed: false, createdAt: now, messages };
   } finally {
@@ -172,122 +200,90 @@ function addHighlight(inputPath, data) {
   }
 }
 
-function setHighlightNote(inputPath, id, note) {
-  const db = openDb(inputPath);
+function addHighlightMessage(sessionId, id, author, text, agentId = null) {
+  requireActiveSession(sessionId);
+  const db = openDb();
   try {
-    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
-    if (!existing) return null;
-    const humanMsg = db.prepare("SELECT id FROM messages WHERE highlight_id = ? AND author = 'human' ORDER BY seq LIMIT 1").get(id);
-    if (humanMsg) {
-      db.prepare("UPDATE messages SET text = ? WHERE id = ?").run(note, humanMsg.id);
-    } else {
-      const seq = db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 as next FROM messages WHERE highlight_id = ?").get(id);
-      const msgId = "msg-" + randomBytes(3).toString("hex");
-      db.prepare("INSERT INTO messages (id, highlight_id, author, text, created_at, seq) VALUES (?, ?, 'human', ?, ?, ?)").run(msgId, id, note, new Date().toISOString(), seq.next);
-    }
-    return loadHighlights(inputPath).find((h) => h.id === id) || null;
-  } finally {
-    db.close();
-  }
-}
-
-function addHighlightMessage(inputPath, id, author, text) {
-  const db = openDb(inputPath);
-  try {
-    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ? AND session_id = ?").get(id, sessionId);
     if (!existing) return null;
     const seq = db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 as next FROM messages WHERE highlight_id = ?").get(id);
-    const msgId = "msg-" + randomBytes(3).toString("hex");
+    const msgId = genId("msg-");
     const now = new Date().toISOString();
-    db.prepare("INSERT INTO messages (id, highlight_id, author, text, created_at, seq) VALUES (?, ?, ?, ?, ?, ?)").run(msgId, id, author, text, now, seq.next);
-    const msg = { id: msgId, author, text, createdAt: now };
-    const hl = loadHighlights(inputPath).find((h) => h.id === id);
+    db.prepare("INSERT INTO messages (id, highlight_id, author, agent_id, text, created_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)").run(msgId, id, author, agentId, text, now, seq.next);
+    const msg = { id: msgId, author, agentId: agentId || undefined, text, createdAt: now, seq: seq.next };
+    const hl = loadHighlights(sessionId).find((h) => h.id === id);
     return { highlight: hl, message: msg };
   } finally {
     db.close();
   }
 }
 
-function setHighlightResolved(inputPath, id, resolved) {
-  const db = openDb(inputPath);
+function setHighlightResolved(sessionId, id, resolved, completed = false) {
+  requireActiveSession(sessionId);
+  const db = openDb();
   try {
-    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ? AND session_id = ?").get(id, sessionId);
     if (!existing) return null;
-    db.prepare("UPDATE highlights SET resolved = ? WHERE id = ?").run(resolved ? 1 : 0, id);
-    return loadHighlights(inputPath).find((h) => h.id === id) || null;
+    db.prepare("UPDATE highlights SET resolved = ?, completed = ?, completed_at = ? WHERE id = ?").run(resolved ? 1 : 0, completed ? 1 : 0, completed ? new Date().toISOString() : null, id);
+    return loadHighlights(sessionId).find((h) => h.id === id) || null;
   } finally {
     db.close();
   }
 }
 
-function removeHighlight(inputPath, id) {
-  const db = openDb(inputPath);
+function markRead(sessionId, id, agentId) {
+  const db = openDb();
   try {
-    const existing = db.prepare("SELECT id FROM highlights WHERE id = ?").get(id);
-    if (!existing) return false;
-    const now = new Date().toISOString();
-    db.prepare("UPDATE highlights SET completed = 1, resolved = 1, completed_at = ? WHERE id = ?").run(now, id);
+    const row = db.prepare("SELECT COALESCE(MAX(m.seq), -1) AS last_seq FROM highlights h LEFT JOIN messages m ON m.highlight_id = h.id WHERE h.id = ? AND h.session_id = ?").get(id, sessionId);
+    if (!row) return false;
+    db.prepare("INSERT INTO agent_reads (session_id, agent_id, highlight_id, last_read_seq, read_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, agent_id, highlight_id) DO UPDATE SET last_read_seq = excluded.last_read_seq, read_at = excluded.read_at").run(sessionId, agentId, id, row.last_seq, new Date().toISOString());
     return true;
-  } finally {
-    db.close();
-  }
+  } finally { db.close(); }
 }
 
-function clearAllHighlights(inputPath) {
-  const db = openDb(inputPath);
+function getUnread(sessionId, agentId) {
+  const highlights = loadHighlights(sessionId);
+  const db = openDb();
   try {
-    const now = new Date().toISOString();
-    db.prepare("UPDATE highlights SET completed = 1, resolved = 1, completed_at = ? WHERE completed = 0").run(now);
-    return true;
-  } finally {
-    db.close();
-  }
+    const reads = new Map(db.prepare("SELECT highlight_id, last_read_seq FROM agent_reads WHERE session_id = ? AND agent_id = ?").all(sessionId, agentId).map((r) => [r.highlight_id, r.last_read_seq]));
+    return highlights.filter((h) => !reads.has(h.id) || h.messages.some((m) => m.seq > reads.get(h.id)));
+  } finally { db.close(); }
 }
 
-function lastMessageAuthor(hl) {
-  if (!hl.messages || hl.messages.length === 0) return null;
-  return hl.messages[hl.messages.length - 1].author;
-}
-
-function printHighlights(inputPath, filter) {
-  let highlights = loadHighlights(inputPath);
-  const fname = basename(inputPath);
-
-  if (filter === "needs-attention") {
-    highlights = highlights.filter((h) => !h.completed && !h.resolved && lastMessageAuthor(h) === "human");
-  }
-
-  if (highlights.length === 0) {
-    const label = filter === "needs-attention" ? "needing attention" : "";
-    console.log(`  No highlights ${label} for ${fname}`);
-    return;
-  }
-
+function renderCloseSummary(session, highlights, currentContent) {
   const open = highlights.filter((h) => !h.resolved && !h.completed).length;
   const resolved = highlights.filter((h) => h.resolved && !h.completed).length;
   const completed = highlights.filter((h) => h.completed).length;
-  const summary = `${highlights.length} total, ${open} open, ${resolved} resolved, ${completed} completed`;
-  console.log(`  Highlights for ${fname} (${summary}):\n`);
-
-  for (const h of highlights) {
-    const section = h.sectionId ? `§${h.sectionId}` : "§(top)";
-    const preview = h.text.length > 80 ? h.text.slice(0, 77) + "…" : h.text;
-    let status = "";
-    if (h.completed) status = " [COMPLETED]";
-    else if (h.resolved) status = " [RESOLVED]";
-    console.log(`  ${h.id}  ${section}${status}`);
-    console.log(`    "${preview}"`);
-    if (h.messages && h.messages.length > 0) {
-      for (const m of h.messages) {
-        const label = m.author === "human" ? "YOU" : "AI";
-        const mprev = m.text.length > 80 ? m.text.slice(0, 77) + "…" : m.text;
-        console.log(`    [${label}] ${mprev}`);
-      }
-    }
-    console.log(`    created: ${h.createdAt}`);
-    if (h.completedAt) console.log(`    completed: ${h.completedAt}`);
-    console.log();
+  const lines = [`# Review session ${session.id}`, "", `Document: ${session.path}`, `Started: ${session.createdAt}`, `Closed: ${new Date().toISOString()}`, `Highlights: ${highlights.length} total · ${open} open · ${resolved} resolved · ${completed} completed`, "", "## Document changes"];
+  if (currentContent === session.initialContent) lines.push("No document changes detected.");
+  else {
+    const before = session.initialContent.split("\n");
+    const after = currentContent.split("\n");
+    let start = 0;
+    while (start < before.length && start < after.length && before[start] === after[start]) start++;
+    let endBefore = before.length - 1, endAfter = after.length - 1;
+    while (endBefore >= start && endAfter >= start && before[endBefore] === after[endAfter]) { endBefore--; endAfter--; }
+    lines.push(`Changed lines ${start + 1}–${Math.max(start + 1, endBefore + 1)} (baseline) → ${start + 1}–${Math.max(start + 1, endAfter + 1)} (current):`);
+    for (const line of before.slice(start, endBefore + 1).slice(0, 80)) lines.push(`- ${line}`);
+    for (const line of after.slice(start, endAfter + 1).slice(0, 80)) lines.push(`+ ${line}`);
   }
+  lines.push("", "## Review trail");
+  for (const h of highlights) {
+    const status = h.completed ? "completed" : h.resolved ? "resolved" : "open";
+    lines.push(`- ${h.id} (${status}): ${h.text.slice(0, 160)}`);
+    for (const m of h.messages) lines.push(`  - ${m.author}${m.agentId ? ` (${m.agentId})` : ""}: ${m.text}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function closeSession(sessionId) {
+  const session = getSession(sessionId);
+  if (!session) return null;
+  const summary = renderCloseSummary(session, loadHighlights(sessionId), readFileSync(session.path, "utf8"));
+  const db = openDb();
+  try { db.prepare("UPDATE sessions SET state = 'closed', closed_at = ?, close_summary = ? WHERE id = ?").run(new Date().toISOString(), summary, sessionId); }
+  finally { db.close(); }
+  return summary;
 }
 
 // ── Markdown helpers ───────────────────────────────────────────────────────
@@ -1518,7 +1514,7 @@ function writeStatic(inputPath, outputPath) {
   console.log(`  wrote ${outputPath}`);
 }
 
-function serveAuto(inputPath, opts) {
+function serveAuto(inputPath, opts, session) {
   let currentHtml = "";
   let currentTitle = "";
   let currentFrontmatter = "";
@@ -1585,8 +1581,13 @@ function serveAuto(inputPath, opts) {
     }
 
     // Highlight REST API
+    if (pathname === "/__session__" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ id: session.id, path: session.path, state: session.state }));
+      return;
+    }
     if (pathname === "/__highlights__" && req.method === "GET") {
-      const hls = loadHighlights(inputPath);
+      const hls = loadHighlights(session.id);
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(hls));
       return;
@@ -1600,7 +1601,7 @@ function serveAuto(inputPath, opts) {
             res.end(JSON.stringify({ error: "text required" }));
             return;
           }
-          const hl = addHighlight(inputPath, data);
+          const hl = addHighlight(session.id, data);
           res.writeHead(201, {
             "Content-Type": "application/json",
             Location: `/__highlights__/${hl.id}`,
@@ -1617,7 +1618,7 @@ function serveAuto(inputPath, opts) {
     const hlIdMatch = pathname.match(/^\/__highlights__\/([^/]+)$/);
     if (hlIdMatch && req.method === "DELETE") {
       const id = hlIdMatch[1];
-      const removed = removeHighlight(inputPath, id);
+      const removed = setHighlightResolved(session.id, id, true, true);
       if (removed) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, id }));
@@ -1632,16 +1633,9 @@ function serveAuto(inputPath, opts) {
       const id = hlIdMatch[1];
       readBody(req).then((body) => {
         try {
-          const data = JSON.parse(body);
-          const hl = setHighlightNote(inputPath, id, data.note || "");
-          if (hl) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(hl));
-            broadcastHighlights();
-          } else {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "not found" }));
-          }
+          JSON.parse(body);
+          res.writeHead(410, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "editing an initial note is not supported" }));
         } catch (e) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: e.message }));
@@ -1663,7 +1657,7 @@ function serveAuto(inputPath, opts) {
             return;
           }
           const author = data.author || "ai";
-          const result = addHighlightMessage(inputPath, id, author, data.text.trim());
+          const result = addHighlightMessage(session.id, id, author, data.text.trim(), data.agentId || null);
           if (result) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(result));
@@ -1684,7 +1678,7 @@ function serveAuto(inputPath, opts) {
     const resolveMatch = pathname.match(/^\/__highlights__\/([^/]+)\/resolve$/);
     if (resolveMatch && req.method === "PATCH") {
       const id = resolveMatch[1];
-      const hl = setHighlightResolved(inputPath, id, true);
+      const hl = setHighlightResolved(session.id, id, true);
       if (hl) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(hl));
@@ -1700,7 +1694,7 @@ function serveAuto(inputPath, opts) {
     const unresolveMatch = pathname.match(/^\/__highlights__\/([^/]+)\/unresolve$/);
     if (unresolveMatch && req.method === "PATCH") {
       const id = unresolveMatch[1];
-      const hl = setHighlightResolved(inputPath, id, false);
+      const hl = setHighlightResolved(session.id, id, false);
       if (hl) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(hl));
@@ -1724,7 +1718,8 @@ function serveAuto(inputPath, opts) {
 
   server.listen(opts.port, () => {
     const url = `http://localhost:${opts.port}`;
-    console.log(`\n  mdhtml serving ${inputPath}`);
+    console.log(`\n  spotlight-md serving ${inputPath}`);
+    console.log(`  session: ${session.id}${session.resumed ? " (resumed)" : ""}`);
     console.log(`  → ${url}\n`);
     if (opts.open) {
       try {
@@ -1903,104 +1898,77 @@ commit it to version control (add *.highlights.db to .gitignore).
   process.exit(0);
 }
 
-if (opts.files.length === 0) {
-  console.error("Usage: mdhtml [--auto] [--port N] [--output PATH] file.md");
-  process.exit(1);
+function requireSession() {
+  if (!opts.sessionId) throw new Error("--session-id is required");
+  const session = getSession(opts.sessionId);
+  if (!session) throw new Error(`session ${opts.sessionId} not found`);
+  return session;
 }
 
-const inputPath = resolve(opts.files[0]);
+function emit(value) { console.log(opts.json ? JSON.stringify(value) : typeof value === "string" ? value : JSON.stringify(value, null, 2)); }
+
+async function waitForUpdates(sessionId, agentId) {
+  let updates = getUnread(sessionId, agentId);
+  if (updates.length || !opts.wait) return updates;
+  return new Promise((resolveWait) => {
+    const timer = setInterval(() => {
+      updates = getUnread(sessionId, agentId);
+      if (updates.length) { clearInterval(timer); resolveWait(updates); }
+    }, 250);
+  });
+}
 
 try {
+  if (opts.command) {
+    const session = requireSession();
+    if (opts.command === "list-highlights") {
+      emit(loadHighlights(session.id).map((h) => ({ id: h.id, text: h.text.slice(0, 120), commentCount: h.messages.length, status: h.completed ? "completed" : h.resolved ? "resolved" : "open", createdAt: h.createdAt })));
+    } else if (opts.command === "get-highlight-details") {
+      if (!opts.highlightId) throw new Error("--highlight-id is required");
+      const highlight = loadHighlights(session.id).find((h) => h.id === opts.highlightId);
+      if (!highlight) throw new Error(`highlight ${opts.highlightId} not found`);
+      emit(highlight);
+    } else if (opts.command === "get-new-comments") {
+      if (!opts.agentId) throw new Error("--agent-id is required");
+      emit(await waitForUpdates(session.id, opts.agentId));
+    } else if (opts.command === "ai-agent-mark-read") {
+      if (!opts.highlightId || !opts.agentId) throw new Error("--highlight-id and --agent-id are required");
+      if (!markRead(session.id, opts.highlightId, opts.agentId)) throw new Error(`highlight ${opts.highlightId} not found`);
+      emit({ ok: true, highlightId: opts.highlightId, agentId: opts.agentId });
+    } else if (opts.command === "add-comment") {
+      if (!opts.highlightId || !opts.comment) throw new Error("--highlight-id and --comment are required");
+      const result = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
+      if (!result) throw new Error(`highlight ${opts.highlightId} not found`);
+      if (opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
+      emit(result);
+    } else if (opts.command === "ai-agent-mark-as-completed") {
+      if (!opts.highlightId || !opts.comment) throw new Error("--highlight-id and --comment are required");
+      const result = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
+      if (!result || !setHighlightResolved(session.id, opts.highlightId, true, true)) throw new Error(`highlight ${opts.highlightId} not found`);
+      if (opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
+      emit({ ok: true, highlightId: opts.highlightId, status: "completed" });
+    } else if (opts.command === "close-session") {
+      emit(closeSession(session.id));
+    } else if (opts.command === "reopen-session") {
+      const db = openDb();
+      try { db.prepare("UPDATE sessions SET state = 'active', closed_at = NULL WHERE id = ?").run(session.id); } finally { db.close(); }
+      emit({ ok: true, sessionId: session.id, state: "active" });
+    }
+    process.exit(0);
+  }
+
+  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md list-highlights --session-id ID");
+  const inputPath = resolve(opts.files[0]);
   statSync(inputPath);
+  if (opts.auto) {
+    const session = getOrCreateSession(inputPath, opts.newSession);
+    if (opts.json) console.log(JSON.stringify({ sessionId: session.id, path: session.path, resumed: session.resumed, url: `http://localhost:${opts.port}` }));
+    serveAuto(inputPath, opts, session);
+  } else {
+    const outputPath = resolve(opts.output || inputPath.replace(/\.md$/i, ".html"));
+    writeStatic(inputPath, outputPath);
+  }
 } catch (e) {
-  console.error(`File not found: ${inputPath}`);
+  console.error(`spotlight-md: ${e.message}`);
   process.exit(1);
-}
-
-// ── Highlight CLI commands ─────────────────────────────────────────────────
-if (opts.listHighlights) {
-  printHighlights(inputPath);
-  process.exit(0);
-}
-
-if (opts.needsAttention) {
-  printHighlights(inputPath, "needs-attention");
-  process.exit(0);
-}
-
-if (opts.clearHighlights) {
-  clearAllHighlights(inputPath);
-  console.log(`  marked all highlights as completed for ${basename(inputPath)}`);
-  process.exit(0);
-}
-
-if (opts.deleteHighlight) {
-  const removed = removeHighlight(inputPath, opts.deleteHighlight);
-  if (removed) {
-    console.log(`  deleted ${opts.deleteHighlight} from ${basename(inputPath)}`);
-  } else {
-    console.error(`  highlight ${opts.deleteHighlight} not found`);
-    process.exit(1);
-  }
-  process.exit(0);
-}
-
-if (opts.addComment) {
-  if (!opts.commentText) {
-    console.error("  --add-comment requires --comment-text");
-    process.exit(1);
-  }
-  const result = addHighlightMessage(inputPath, opts.addComment, "ai", opts.commentText);
-  if (result) {
-    console.log(`  added AI comment to ${opts.addComment}`);
-  } else {
-    console.error(`  highlight ${opts.addComment} not found`);
-    process.exit(1);
-  }
-  process.exit(0);
-}
-
-if (opts.addReply) {
-  if (!opts.replyText) {
-    console.error("  --add-reply requires --reply-text");
-    process.exit(1);
-  }
-  const result = addHighlightMessage(inputPath, opts.addReply, "human", opts.replyText);
-  if (result) {
-    console.log(`  added reply to ${opts.addReply}`);
-  } else {
-    console.error(`  highlight ${opts.addReply} not found`);
-    process.exit(1);
-  }
-  process.exit(0);
-}
-
-if (opts.resolveHighlight) {
-  const hl = setHighlightResolved(inputPath, opts.resolveHighlight, true);
-  if (hl) {
-    console.log(`  resolved ${opts.resolveHighlight}`);
-  } else {
-    console.error(`  highlight ${opts.resolveHighlight} not found`);
-    process.exit(1);
-  }
-  process.exit(0);
-}
-
-if (opts.unresolveHighlight) {
-  const hl = setHighlightResolved(inputPath, opts.unresolveHighlight, false);
-  if (hl) {
-    console.log(`  reopened ${opts.unresolveHighlight}`);
-  } else {
-    console.error(`  highlight ${opts.unresolveHighlight} not found`);
-    process.exit(1);
-  }
-  process.exit(0);
-}
-
-// ── Auto / static ──────────────────────────────────────────────────────────
-if (opts.auto) {
-  serveAuto(inputPath, opts);
-} else {
-  const outputPath = resolve(opts.output || inputPath.replace(/\.md$/i, ".html"));
-  writeStatic(inputPath, outputPath);
 }

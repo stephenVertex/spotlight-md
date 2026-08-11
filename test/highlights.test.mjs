@@ -45,15 +45,31 @@ async function stop(child) {
   await exited;
 }
 
-test("browser highlight API creates the expected SQLite sidecar and survives server stop", async (t) => {
+function cli(args, env) {
+  return spawnSync(process.execPath, [toolPath, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
+}
+
+function waitCli(args, env) {
+  const child = spawn(process.execPath, [toolPath, ...args], { env: { ...process.env, ...env } });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  return { child, done: once(child, "exit").then(([code]) => ({ code, stdout, stderr })) };
+}
+
+test("global service sessions support agent cursors, completion, and close summaries", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "spotlight-md-highlights-"));
   const inputPath = join(dir, "2026-08-10-audit.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
   const port = await unusedPort();
   const url = `http://127.0.0.1:${port}`;
   writeFileSync(inputPath, "# Audit\n\nSelected audit passage\n");
 
   const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
     stdio: "ignore",
+    env: { ...process.env, ...env },
   });
 
   t.after(async () => {
@@ -74,18 +90,50 @@ test("browser highlight API creates the expected SQLite sidecar and survives ser
   });
   assert.equal(createResponse.status, 201);
   const highlight = await createResponse.json();
-  assert.match(highlight.id, /^hl-[a-f0-9]{6}$/);
+  assert.match(highlight.id, /^hl-[a-f0-9]{10}$/);
   assert.equal(highlight.text, "Selected audit passage");
-  assert.ok(existsSync(`${inputPath}.highlights.db`), "creates <file>.md.highlights.db");
+  assert.ok(existsSync(join(configDir, "global-highlights-db.db")), "creates the global database");
 
-  const resolveResponse = await fetch(`${url}/__highlights__/${highlight.id}/resolve`, { method: "PATCH" });
-  assert.equal(resolveResponse.status, 200);
-  assert.equal((await resolveResponse.json()).resolved, true);
+  const sessionResponse = await fetch(`${url}/__session__`);
+  assert.equal(sessionResponse.status, 200);
+  const session = await sessionResponse.json();
+  assert.match(session.id, /^sp-[a-f0-9]{10}$/);
 
-  await stop(child);
-  const list = spawnSync(process.execPath, [toolPath, "--list-highlights", inputPath], { encoding: "utf8" });
-  assert.equal(list.status, 0, list.stderr);
-  assert.match(list.stdout, /Selected audit passage/);
+  let result = cli(["list-highlights", "--session-id", session.id, "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout).map((h) => h.id), [highlight.id]);
+
+  result = cli(["get-new-comments", "--session-id", session.id, "--agent-id", "codex-test", "--json"], env);
+  assert.equal(JSON.parse(result.stdout)[0].id, highlight.id);
+  assert.equal(cli(["ai-agent-mark-read", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--json"], env).status, 0);
+  result = cli(["get-new-comments", "--session-id", session.id, "--agent-id", "codex-test", "--json"], env);
+  assert.deepEqual(JSON.parse(result.stdout), []);
+
+  result = cli(["add-comment", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--comment", "Acknowledged", "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).message.text, "Acknowledged");
+
+  const waiting = waitCli(["get-new-comments", "--session-id", session.id, "--agent-id", "codex-test", "--wait", "--json"], env);
+  t.after(() => waiting.child.kill("SIGTERM"));
+  await sleep(100);
+  const replyResponse = await fetch(`${url}/__highlights__/${highlight.id}/messages`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ author: "human", text: "Please complete it" }),
+  });
+  assert.equal(replyResponse.status, 200);
+  const wake = await waiting.done;
+  assert.equal(wake.code, 0, wake.stderr);
+  assert.equal(JSON.parse(wake.stdout)[0].messages.at(-1).text, "Please complete it");
+
+  result = cli(["ai-agent-mark-as-completed", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--comment", "Completed as requested", "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "completed");
+
+  writeFileSync(inputPath, "# Audit\n\nUpdated audit passage\n");
+  result = cli(["close-session", "--session-id", session.id], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Review session/);
+  assert.match(result.stdout, /\+ Updated audit passage/);
+  assert.match(result.stdout, /Completed as requested/);
 });
 
 test("selection popup submit handler receives its event instead of referencing an undeclared variable", () => {
