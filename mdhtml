@@ -6,7 +6,7 @@
 //   mdhtml --port 4040 --auto file.md
 // Zero dependencies. Node 18+.
 
-import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync } from "node:fs";
+import { chmodSync, readFileSync, realpathSync, unlinkSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync } from "node:fs";
 import { resolve, dirname, basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 import { createServer } from "node:http";
@@ -18,12 +18,13 @@ const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
+  const opts = { auto: false, daemon: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
     else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
+    else if (a === "--daemon") opts.daemon = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
     else if (a === "--no-open") opts.open = false;
@@ -959,27 +960,29 @@ mark.mdhtml-hl:hover {
 }
 `;
 
-function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName) {
+function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName, documentRoute = "") {
+  const apiBase = JSON.stringify(documentRoute);
   const reloadScript = autoMode
     ? `<div id="reload-badge">Reloading…</div>
 <script>
 (function(){
+  var apiBase = ${apiBase};
   var badge = document.getElementById('reload-badge');
   function showBadge(){ badge.classList.add('show'); }
   try {
-    var es = new EventSource('/__reload__');
+    var es = new EventSource(apiBase + '/__reload__');
     es.addEventListener('reload', function(){
       showBadge();
       setTimeout(function(){ location.reload(); }, 200);
     });
   } catch(e){
     setInterval(function(){
-      fetch('/__mtime__').then(r=>r.text()).then(function(t){
+      fetch(apiBase + '/__mtime__').then(r=>r.text()).then(function(t){
         if(window._mtime && t !== window._mtime){ showBadge(); setTimeout(function(){ location.reload(); }, 200); }
         window._mtime = t;
       }).catch(function(){});
     }, 1500);
-    fetch('/__mtime__').then(r=>r.text()).then(function(t){ window._mtime = t; });
+    fetch(apiBase + '/__mtime__').then(r=>r.text()).then(function(t){ window._mtime = t; });
   }
 })();
 </script>`
@@ -1026,6 +1029,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   const highlightScript = autoMode ? `
 <script>
 (function(){
+  var apiBase = ${apiBase};
   var content = document.querySelector('.content');
   if (!content) return;
   var selPopup = null;
@@ -1199,7 +1203,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         resolveEl.addEventListener('click', function(e){
           e.stopPropagation();
           var action = resolveEl.dataset.action;
-          fetch('/__highlights__/' + id + '/' + action, { method: 'PATCH' })
+          fetch(apiBase + '/__highlights__/' + id + '/' + action, { method: 'PATCH' })
             .then(function(r){return r.json()})
             .then(function(){ loadAndApply(); })
             .catch(function(){});
@@ -1247,7 +1251,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       e.stopPropagation();
       var text = editor.value.trim();
       if (!text) { cleanup(); return; }
-      fetch('/__highlights__/' + id + '/messages', {
+      fetch(apiBase + '/__highlights__/' + id + '/messages', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ author: 'human', text: text })
@@ -1266,7 +1270,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   }
 
   function loadAndApply() {
-    fetch('/__highlights__').then(function(r){return r.json()}).then(function(hls){
+    fetch(apiBase + '/__highlights__').then(function(r){return r.json()}).then(function(hls){
       clearHighlights();
       hls.forEach(applyHighlight);
       renderPanel(hls);
@@ -1361,7 +1365,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       sectionTitle: selection.sectionTitle,
       note: note || undefined
     });
-    fetch('/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
+    fetch(apiBase + '/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
       .then(function(r){
         if (!r.ok) throw new Error('could not create highlight');
         return r.json();
@@ -1404,7 +1408,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   }
 
   function completeHighlight(id) {
-    fetch('/__highlights__/' + id, {method:'DELETE'})
+    fetch(apiBase + '/__highlights__/' + id, {method:'DELETE'})
       .then(function(r){return r.json()})
       .then(function(){
         loadAndApply();
@@ -1444,7 +1448,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   // -- SSE: listen for highlight updates --
   try {
-    var es = new EventSource('/__reload__');
+    var es = new EventSource(apiBase + '/__reload__');
     es.addEventListener('highlights-updated', function(){
       loadAndApply();
     });
@@ -1535,6 +1539,328 @@ function writeStatic(inputPath, outputPath) {
   const full = buildHtml(title, html, frontmatterHtml, tocHtml, false, opts.theme);
   writeFileSync(outputPath, full);
   console.log(`  wrote ${outputPath}`);
+}
+
+// ── Persistent multi-document daemon ─────────────────────────────────────
+function daemonStatePath(port) {
+  const configDir = process.env.SPOTLIGHT_MD_CONFIG_DIR || join(homedir(), ".config", "spotlight-md");
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  return join(configDir, `daemon-${port}.json`);
+}
+
+function virtualDocumentRoute(inputPath) {
+  const renderedPath = inputPath.replace(/\.md$/i, ".html");
+  const segments = renderedPath.replace(/\\/g, "/").split("/").filter(Boolean);
+  return "/spotlight/" + segments.map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
+
+function normalizeUrlPath(pathname) {
+  return pathname.split("/").map((segment) => encodeURIComponent(decodeURIComponent(segment)).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
+
+function readRequestBody(req, limit = 1024 * 1024) {
+  return new Promise((resolveBody, rejectBody) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > limit) rejectBody(new Error("request body too large"));
+    });
+    req.on("end", () => resolveBody(data));
+    req.on("error", rejectBody);
+  });
+}
+
+function sendJson(res, status, value, extraHeaders = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", ...extraHeaders });
+  res.end(JSON.stringify(value));
+}
+
+function createDocumentState(inputPath, theme, session) {
+  const document = {
+    path: inputPath,
+    route: virtualDocumentRoute(inputPath),
+    theme,
+    session,
+    title: "",
+    html: "",
+    frontmatterHtml: "",
+    tocHtml: "",
+    mtime: 0,
+    clients: [],
+    debounceTimer: null,
+    watcher: null,
+  };
+
+  rebuildDocument(document);
+  document.watcher = () => {
+    if (document.debounceTimer) clearTimeout(document.debounceTimer);
+    document.debounceTimer = setTimeout(() => {
+      try {
+        rebuildDocument(document);
+        broadcastDocument(document, "reload");
+      } catch (error) {
+        console.error(`spotlight-md: could not re-render ${document.path}: ${error.message}`);
+      }
+    }, 150);
+  };
+  watchFile(document.path, { interval: 500 }, document.watcher);
+  return document;
+}
+
+function rebuildDocument(document) {
+  const rendered = renderFile(document.path);
+  document.title = rendered.title;
+  document.html = rendered.html;
+  document.frontmatterHtml = rendered.frontmatterHtml;
+  document.tocHtml = rendered.tocHtml;
+  document.mtime = statSync(document.path).mtimeMs;
+}
+
+function broadcastDocument(document, event) {
+  for (const client of document.clients) client.write(`event: ${event}\ndata: {}\n\n`);
+}
+
+function closeDocumentState(document) {
+  if (document.debounceTimer) clearTimeout(document.debounceTimer);
+  if (document.watcher) unwatchFile(document.path, document.watcher);
+  for (const client of document.clients) client.end();
+  document.clients.length = 0;
+}
+
+async function handleDocumentRequest(document, subpath, req, res) {
+  if (subpath === "" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(buildHtml(document.title, document.html, document.frontmatterHtml, document.tocHtml, true, document.theme, document.route));
+    return;
+  }
+
+  if (subpath === "/__reload__" && req.method === "GET") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write("retry: 2000\n\n");
+    document.clients.push(res);
+    req.on("close", () => {
+      const index = document.clients.indexOf(res);
+      if (index !== -1) document.clients.splice(index, 1);
+    });
+    return;
+  }
+
+  if (subpath === "/__session__" && req.method === "GET") {
+    sendJson(res, 200, { id: document.session.id, path: document.session.path, state: document.session.state });
+    return;
+  }
+  if (subpath === "/__highlights__" && req.method === "GET") {
+    sendJson(res, 200, loadHighlights(document.session.id));
+    return;
+  }
+  if (subpath === "/__highlights__" && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    if (!data.text || data.text.trim().length < 2) {
+      sendJson(res, 400, { error: "text required" });
+      return;
+    }
+    const highlight = addHighlight(document.session.id, data);
+    sendJson(res, 201, highlight, { Location: `${document.route}/__highlights__/${highlight.id}` });
+    broadcastDocument(document, "highlights-updated");
+    return;
+  }
+
+  const highlightMatch = subpath.match(/^\/__highlights__\/([^/]+)$/);
+  if (highlightMatch && req.method === "DELETE") {
+    const id = highlightMatch[1];
+    const removed = setHighlightResolved(document.session.id, id, true, true);
+    if (!removed) sendJson(res, 404, { error: "not found" });
+    else {
+      sendJson(res, 200, { ok: true, id });
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+  if (highlightMatch && req.method === "PATCH") {
+    sendJson(res, 410, { error: "editing an initial note is not supported" });
+    return;
+  }
+
+  const messageMatch = subpath.match(/^\/__highlights__\/([^/]+)\/messages$/);
+  if (messageMatch && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    if (!data.text || data.text.trim().length < 1) {
+      sendJson(res, 400, { error: "text required" });
+      return;
+    }
+    const result = addHighlightMessage(document.session.id, messageMatch[1], data.author || "ai", data.text.trim(), data.agentId || null);
+    if (!result) sendJson(res, 404, { error: "highlight not found" });
+    else {
+      sendJson(res, 200, result);
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+
+  const resolvedMatch = subpath.match(/^\/__highlights__\/([^/]+)\/(resolve|unresolve)$/);
+  if (resolvedMatch && req.method === "PATCH") {
+    const highlight = setHighlightResolved(document.session.id, resolvedMatch[1], resolvedMatch[2] === "resolve");
+    if (!highlight) sendJson(res, 404, { error: "not found" });
+    else {
+      sendJson(res, 200, highlight);
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+
+  if (subpath === "/__mtime__" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+    res.end(String(document.mtime));
+    return;
+  }
+
+  sendJson(res, 404, { error: "not found" });
+}
+
+function serveDaemon(daemonOpts) {
+  const token = process.env.SPOTLIGHT_MD_DAEMON_TOKEN || randomBytes(24).toString("hex");
+  const statePath = daemonStatePath(daemonOpts.port);
+  const documentsByRoute = new Map();
+  const documentsByPath = new Map();
+  const startedAt = new Date().toISOString();
+  let shuttingDown = false;
+
+  function isAuthorized(req) {
+    return req.headers["x-spotlight-token"] === token;
+  }
+
+  function status() {
+    return {
+      service: "spotlight-md",
+      version: VERSION,
+      running: true,
+      pid: process.pid,
+      port: daemonOpts.port,
+      startedAt,
+      documents: [...documentsByPath.values()].map((document) => ({
+        path: document.path,
+        route: document.route,
+        sessionId: document.session.id,
+      })),
+    };
+  }
+
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || "/", "http://localhost");
+      const pathname = normalizeUrlPath(url.pathname);
+      if (pathname === "/__spotlight__/health" && req.method === "GET") {
+        sendJson(res, 200, { service: "spotlight-md", version: VERSION });
+        return;
+      }
+      if (pathname === "/__spotlight__/status" && req.method === "GET") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        sendJson(res, 200, status());
+        return;
+      }
+      if (pathname === "/__spotlight__/register" && req.method === "POST") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        const registration = JSON.parse(await readRequestBody(req));
+        if (!registration.path || typeof registration.path !== "string") {
+          sendJson(res, 400, { error: "path required" });
+          return;
+        }
+        const canonicalPath = realpathSync(registration.path);
+        if (!statSync(canonicalPath).isFile()) {
+          sendJson(res, 400, { error: "path must be a file" });
+          return;
+        }
+        const session = getOrCreateSession(canonicalPath, !!registration.newSession);
+        let document = documentsByPath.get(canonicalPath);
+        if (document) {
+          document.theme = registration.theme || "github-dark";
+          document.session = session;
+          rebuildDocument(document);
+          broadcastDocument(document, "reload");
+        } else {
+          document = createDocumentState(canonicalPath, registration.theme || "github-dark", session);
+          if (documentsByRoute.has(document.route)) throw new Error("document route collision");
+          documentsByPath.set(canonicalPath, document);
+          documentsByRoute.set(document.route, document);
+        }
+        sendJson(res, 200, {
+          sessionId: session.id,
+          path: canonicalPath,
+          resumed: session.resumed,
+          route: document.route,
+          url: `http://localhost:${daemonOpts.port}${document.route}`,
+        });
+        return;
+      }
+      if (pathname === "/__spotlight__/stop" && req.method === "POST") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, pid: process.pid });
+        setTimeout(shutdown, 10);
+        return;
+      }
+
+      let matchedDocument = documentsByRoute.get(pathname);
+      let subpath = "";
+      if (!matchedDocument) {
+        for (const [route, document] of documentsByRoute) {
+          if (pathname.startsWith(route + "/__")) {
+            matchedDocument = document;
+            subpath = pathname.slice(route.length);
+            break;
+          }
+        }
+      }
+      if (!matchedDocument) {
+        sendJson(res, 404, { error: "document is not registered" });
+        return;
+      }
+      await handleDocumentRequest(matchedDocument, subpath, req, res);
+    } catch (error) {
+      if (!res.headersSent) sendJson(res, error instanceof URIError ? 400 : 500, { error: error.message });
+      else res.end();
+    }
+  });
+
+  function removeOwnStateFile() {
+    try {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      if (state.pid === process.pid && state.token === token) unlinkSync(statePath);
+    } catch { /* State may already be absent or replaced by another daemon. */ }
+  }
+
+  function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    for (const document of documentsByPath.values()) closeDocumentState(document);
+    removeOwnStateFile();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  }
+
+  server.on("error", (error) => {
+    console.error(`spotlight-md: daemon could not listen on port ${daemonOpts.port}: ${error.message}`);
+    process.exit(1);
+  });
+  server.listen(daemonOpts.port, "127.0.0.1", () => {
+    writeFileSync(statePath, JSON.stringify({ pid: process.pid, port: daemonOpts.port, token, startedAt }) + "\n", { mode: 0o600 });
+    chmodSync(statePath, 0o600);
+  });
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 function serveAuto(inputPath, opts, session) {
@@ -1779,6 +2105,11 @@ function serveAuto(inputPath, opts, session) {
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 const opts = parseArgs(process.argv.slice(2));
+
+if (opts.daemon) {
+  serveDaemon(opts);
+  await new Promise(() => {});
+}
 
 // ── Prime: AI agent instructions ───────────────────────────────────────────
 if (opts.prime) {
