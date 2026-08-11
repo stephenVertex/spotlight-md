@@ -149,3 +149,12 @@ test("selection popup submit handler receives its event instead of referencing a
     "pressing Enter in the note field must pass its keyboard event to submit",
   );
 });
+
+test("prime teaches agents the session-based collaborative review loop", () => {
+  const result = cli(["prime"], {});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Collaborative Review Guide for AI Agents/);
+  assert.match(result.stdout, /get-new-comments --session-id/);
+  assert.match(result.stdout, /close-session --session-id/);
+  assert.match(result.stdout, /Do not complete a highlight merely because you replied/);
+});

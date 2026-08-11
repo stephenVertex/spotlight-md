@@ -1759,6 +1759,78 @@ const opts = parseArgs(process.argv.slice(2));
 
 // ── Prime: AI agent instructions ───────────────────────────────────────────
 if (opts.prime) {
+  console.log(`# spotlight-md — Collaborative Review Guide for AI Agents
+
+spotlight-md is a human-and-agent document review service. A human reads a
+rendered Markdown document in the browser and creates highlight threads. You
+address those threads by editing the source document, replying with evidence,
+and waiting for the next human response.
+
+## Start or join a review
+
+The human normally starts the browser review surface:
+
+  spotlight-md --auto --json path/to/document.md
+
+The first JSON line contains the sessionId. Reuse that session ID for every
+agent command. Do not use paths for highlight operations. An active session is
+resumed automatically for a document; --new-session deliberately starts a new
+review round.
+
+## Agent loop
+
+Choose a stable agent ID for this run, for example codex-session-abc123.
+
+1. Wait for human work:
+
+     spotlight-md get-new-comments --session-id sp-… --agent-id codex-session-abc123 --wait --json
+
+   This returns immediately if work is already unread, otherwise blocks until a
+   highlight or a new human comment arrives. A highlight without a note is also
+   work: inspect it and the document context.
+
+2. Read the complete thread when needed:
+
+     spotlight-md get-highlight-details --session-id sp-… --highlight-id hl-… --json
+
+3. Edit the Markdown source to address the human’s request. Preserve the
+   surrounding intent; do not change unrelated material.
+
+4. Reply with what changed and why:
+
+     spotlight-md add-comment --session-id sp-… --highlight-id hl-… --agent-id codex-session-abc123 --comment "Reworked the recommendation and added the evaluation gate." --json
+
+   Adding a comment advances your read cursor. If you only inspected a thread,
+   use ai-agent-mark-read instead.
+
+5. Continue waiting. Do not complete a highlight merely because you replied.
+   Complete it only when the human explicitly asks or the agreed workflow says
+   it is done:
+
+     spotlight-md ai-agent-mark-as-completed --session-id sp-… --highlight-id hl-… --agent-id codex-session-abc123 --comment "Completed after the requested review." --json
+
+## End the review
+
+When the human is satisfied, close the session:
+
+  spotlight-md close-session --session-id sp-…
+
+This freezes the review and emits a Markdown audit record containing the
+baseline-to-current document changes and the complete highlight/message trail.
+Use reopen-session only when the human deliberately resumes the review.
+
+## Rules
+
+- Keep comments specific and factual: say what changed, what remains, or why a
+  request needs a decision.
+- Never silently discard or overwrite a human highlight.
+- Do not resolve, complete, or close a review without the human’s direction.
+- Use --json for all automation. Session data is stored centrally in
+  ~/.config/spotlight-md/global-highlights-db.db, not in the document repo.`);
+  process.exit(0);
+}
+
+if (opts.prime) {
   console.log(`# spotlight-md — AI Agent Guide
 
 ## What this tool does
