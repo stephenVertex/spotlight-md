@@ -317,10 +317,28 @@ function setSuggestionStatus(sessionId, id, status) {
   } finally { db.close(); }
 }
 
+// Locate an anchor within the raw markdown. Tries an exact match first, then
+// falls back to a whitespace-flexible match so an anchor copied from the
+// rendered text (where prose is reflowed onto one line) still matches source
+// that is hard-wrapped across several lines. Returns { index, length } or null.
+function findAnchor(raw, anchor) {
+  const exact = raw.indexOf(anchor);
+  if (exact !== -1) return { index: exact, length: anchor.length };
+  const trimmed = anchor.trim();
+  if (!trimmed) return null;
+  // Escape regex metacharacters, then let any run of whitespace in the anchor
+  // match any run of whitespace (spaces, newlines) in the source.
+  const pattern = trimmed
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\s+/g, "\\s+");
+  const m = new RegExp(pattern).exec(raw);
+  return m ? { index: m.index, length: m[0].length } : null;
+}
+
 // Accept a suggestion: splice its anchor→replacement into the raw markdown of
-// the session's document (first verbatim occurrence), then mark it accepted.
-// Returns { suggestion, applied: true } on success, or { error } describing why
-// the splice could not be made so the caller can surface it.
+// the session's document (first occurrence), then mark it accepted. Returns
+// { suggestion, applied: true } on success, or { error } describing why the
+// splice could not be made so the caller can surface it.
 function acceptSuggestion(sessionId, id) {
   const session = requireActiveSession(sessionId);
   const suggestion = getSuggestion(sessionId, id);
@@ -329,11 +347,11 @@ function acceptSuggestion(sessionId, id) {
   let raw;
   try { raw = readFileSync(session.path, "utf8"); }
   catch (e) { return { error: `cannot read document: ${e.message}` }; }
-  const idx = raw.indexOf(suggestion.anchor);
-  if (idx === -1) {
+  const found = findAnchor(raw, suggestion.anchor);
+  if (!found) {
     return { error: "anchor text not found in the document; it may have changed since the suggestion was made" };
   }
-  const updated = raw.slice(0, idx) + suggestion.replacement + raw.slice(idx + suggestion.anchor.length);
+  const updated = raw.slice(0, found.index) + suggestion.replacement + raw.slice(found.index + found.length);
   try { writeFileSync(session.path, updated); }
   catch (e) { return { error: `cannot write document: ${e.message}` }; }
   const applied = setSuggestionStatus(sessionId, id, "accepted");
@@ -1467,15 +1485,22 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     });
   }
 
-  // Approve (splice into the document) or dismiss a suggested edit.
+  // Approve (splice into the document) or dismiss a suggested edit. Surfaces
+  // failures (e.g. the anchor no longer matches the source) instead of failing
+  // silently, so the reviewer knows the click did not take effect.
   function resolveSuggestion(sid, action) {
     fetch('/__suggestions__/' + sid + '/' + action, { method: 'PATCH' })
-      .then(function(r){ return r.json(); })
+      .then(function(r){
+        if (!r.ok) return r.json().catch(function(){ return {}; }).then(function(e){ throw new Error(e.error || ('HTTP ' + r.status)); });
+        return r.json();
+      })
       .then(function(){
-        if (action === 'accept' && window.__spotlightFlash) window.__spotlightFlash('Applied');
+        if (window.__spotlightFlash) window.__spotlightFlash(action === 'accept' ? 'Applied' : 'Dismissed');
         loadAndApply();
       })
-      .catch(function(){});
+      .catch(function(err){
+        if (window.__spotlightFlash) window.__spotlightFlash(action === 'accept' ? "Couldn't apply — text changed" : "Couldn't dismiss");
+      });
   }
 
   // -- Inline suggestion overlays: anchor a hover popover to the highlighted

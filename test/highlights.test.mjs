@@ -204,6 +204,39 @@ test("suggested edits: propose via CLI, approve splices the source, reject leave
   assert.equal(staleRes.status, 409);
 });
 
+test("suggested edits match anchors across markdown line wrapping", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-wrap-"));
+  const inputPath = join(dir, "doc.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  const url = `http://127.0.0.1:${port}`;
+  // The prose is hard-wrapped, so the source has a newline where the rendered
+  // text (and thus a copied anchor) has a space.
+  writeFileSync(inputPath, "# Doc\n\nSmells pleasantly sour (not\nlike nail polish remover), and passes.\n");
+
+  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
+    stdio: "ignore", env: { ...process.env, ...env },
+  });
+  t.after(async () => { await stop(child); rmSync(dir, { recursive: true, force: true }); });
+  await waitForServer(url, child);
+
+  const session = await (await fetch(`${url}/__session__`)).json();
+  const highlight = await (await fetch(`${url}/__highlights__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "(not like nail polish remover)", note: "reword" }),
+  })).json();
+
+  // Anchor uses a single space, matching the rendered text, not the wrapped source.
+  const proposed = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
+    "--anchor", "(not like nail polish remover)", "--replacement", "(not sharp or solvent-like)", "--json"], env).stdout);
+  const acceptRes = await fetch(`${url}/__suggestions__/${proposed.suggestion.id}/accept`, { method: "PATCH" });
+  assert.equal(acceptRes.status, 200, "wrapped anchor should still splice");
+  const after = readFileSync(inputPath, "utf8");
+  assert.match(after, /\(not sharp or solvent-like\)/);
+  assert.doesNotMatch(after, /nail polish remover/);
+});
+
 test("prime documents the suggest-edit workflow for agents", () => {
   const result = cli(["prime"], {});
   assert.equal(result.status, 0, result.stderr);
