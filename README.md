@@ -1,8 +1,8 @@
 # spotlight-md
 
-Version: **0.2.0**
+Version: **0.3.0**
 
-Dark-themed markdown viewer with live reload, sidebar TOC, highlight annotations, and live AI-suggested edits for AI-assisted document review.
+Dark-themed markdown viewer with live reload, sidebar TOC, highlight annotations, live AI-suggested edits, and live "AI is working" indicators for AI-assisted document review.
 
 ## Install
 
@@ -35,6 +35,7 @@ spotlight-md get-new-comments --session-id sp-… --agent-id codex-… --wait --
 spotlight-md add-comment --session-id sp-… --highlight-id hl-… --agent-id codex-… --comment "Addressed it"
 spotlight-md suggest-edit --session-id sp-… --highlight-id hl-… --anchor "old text" --replacement "new text" --comment "Rephrased"
 spotlight-md list-suggestions --session-id sp-… --json
+spotlight-md ai-agent-claim --session-id sp-… --highlight-id hl-… --agent-id codex-…
 spotlight-md ai-agent-mark-as-completed --session-id sp-… --highlight-id hl-… --comment "Completed"
 spotlight-md close-session --session-id sp-…
 spotlight-md --version
@@ -83,6 +84,14 @@ spotlight-md suggest-edit --session-id sp-… --highlight-id hl-… \
 ```
 
 The suggestion appears live in the browser, Google-Docs style: the highlighted passage gains a dashed underline, and hovering it (or opening its panel card) reveals a before/after diff with **Approve** and **Dismiss** buttons. The hover preview floats over the text so nothing reflows. Approving splices the change into the markdown source and updates the page in place; dismissing leaves the document untouched. The conversation thread stays open the whole time, so the human and AI can keep talking about a passage while the AI proposes revisions.
+
+### AI activity indicators
+
+When an agent starts working on a highlight it "claims" it with `ai-agent-claim`, which pulses that exact passage **yellow** in the browser (and marks its panel card as *thinking*) so you can see, at a glance, what the AI is currently working on. The claim releases automatically when the agent replies, suggests an edit, or completes the highlight — and the passage briefly flashes **green** to signal a fresh response. This makes the back-and-forth legible: the AI loops through your highlights while you watch its progress in real time.
+
+### Persistent zoom
+
+A small zoom control sits in the bottom-left corner. Zoom in or out with the buttons or with `Ctrl`/`Cmd` `+` / `-` / `0`. The level is remembered in `localStorage` and reapplied on every load, so a hard refresh keeps your zoom instead of snapping back to 100%.
 
 ### Highlights
 

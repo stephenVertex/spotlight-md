@@ -18,11 +18,11 @@ const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, json: false, newSession: false };
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, release: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
-    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
+    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-claim", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
@@ -41,6 +41,7 @@ function parseArgs(argv) {
     else if (a === "--replacement") opts.replacement = argv[++i];
     else if (a.startsWith("--replacement=")) opts.replacement = a.slice(14);
     else if (a === "--wait") opts.wait = true;
+    else if (a === "--release") opts.release = true;
     else if (a === "--json") opts.json = true;
     else if (a === "--new-session") opts.newSession = true;
     else if (a === "--version" || a === "-V") {
@@ -59,6 +60,7 @@ Usage:
   spotlight-md add-comment --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
   spotlight-md suggest-edit --session-id ID --highlight-id ID --anchor TEXT --replacement TEXT [--comment TEXT] [--agent-id ID]
   spotlight-md list-suggestions --session-id ID [--highlight-id ID] [--json]
+  spotlight-md ai-agent-claim --session-id ID --highlight-id ID [--release] [--agent-id ID]
   spotlight-md ai-agent-mark-as-completed --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
   spotlight-md close-session --session-id ID
   spotlight-md reopen-session --session-id ID
@@ -134,6 +136,14 @@ function openDb() {
       resolved_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_suggestions_session ON suggestions(session_id, status);
+    CREATE TABLE IF NOT EXISTS ai_activity (
+      session_id TEXT NOT NULL,
+      highlight_id TEXT NOT NULL,
+      agent_id TEXT,
+      state TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, highlight_id)
+    );
   `);
   return db;
 }
@@ -358,17 +368,49 @@ function acceptSuggestion(sessionId, id) {
   return { suggestion: applied, applied: true };
 }
 
-// Attach pending suggestions to their highlights for the browser payload.
+// AI activity: an agent "claims" a highlight while it works on it (so the
+// browser can pulse it), and the claim is released when it responds.
+function setAiClaim(sessionId, highlightId, agentId, claimed) {
+  const db = openDb();
+  try {
+    const existing = db.prepare("SELECT id FROM highlights WHERE id = ? AND session_id = ?").get(highlightId, sessionId);
+    if (!existing) return false;
+    if (claimed) {
+      db.prepare("INSERT INTO ai_activity (session_id, highlight_id, agent_id, state, updated_at) VALUES (?, ?, ?, 'thinking', ?) ON CONFLICT(session_id, highlight_id) DO UPDATE SET agent_id = excluded.agent_id, state = 'thinking', updated_at = excluded.updated_at").run(sessionId, highlightId, agentId || null, new Date().toISOString());
+    } else {
+      db.prepare("DELETE FROM ai_activity WHERE session_id = ? AND highlight_id = ?").run(sessionId, highlightId);
+    }
+    return true;
+  } finally { db.close(); }
+}
+
+// Release any claim on a highlight (used automatically when the agent responds).
+function releaseAiClaim(sessionId, highlightId) {
+  const db = openDb();
+  try { db.prepare("DELETE FROM ai_activity WHERE session_id = ? AND highlight_id = ?").run(sessionId, highlightId); }
+  finally { db.close(); }
+}
+
+function loadAiActivity(sessionId) {
+  const db = openDb();
+  try {
+    const rows = db.prepare("SELECT highlight_id, state FROM ai_activity WHERE session_id = ?").all(sessionId);
+    return new Map(rows.map((r) => [r.highlight_id, r.state]));
+  } finally { db.close(); }
+}
+
+// Attach pending suggestions and AI activity to highlights for the browser.
 function loadHighlightsWithSuggestions(sessionId) {
   const highlights = loadHighlights(sessionId);
   const pending = loadSuggestions(sessionId, { status: "pending" });
+  const activity = loadAiActivity(sessionId);
   const byHl = new Map();
   for (const s of pending) {
     if (!s.highlightId) continue;
     if (!byHl.has(s.highlightId)) byHl.set(s.highlightId, []);
     byHl.get(s.highlightId).push(s);
   }
-  return highlights.map((h) => ({ ...h, suggestions: byHl.get(h.id) || [] }));
+  return highlights.map((h) => ({ ...h, suggestions: byHl.get(h.id) || [], aiState: activity.get(h.id) || null }));
 }
 
 function markRead(sessionId, id, agentId) {
@@ -550,6 +592,7 @@ const THEMES = {
     "--accent-dim": "rgba(247,129,102,0.15)",
     "--sugg": "#3fb950",
     "--sugg-del": "#f85149",
+    "--think": "#e3b341",
     "--table-header-bg": "#1c2128",
     "--table-row-alt": "#161b22",
     "--sidebar-bg": "#161b22",
@@ -571,6 +614,7 @@ const THEMES = {
     "--accent-dim": "rgba(189,147,249,0.15)",
     "--sugg": "#50fa7b",
     "--sugg-del": "#ff5555",
+    "--think": "#f1fa8c",
     "--table-header-bg": "#44475a",
     "--table-row-alt": "#21222c",
     "--sidebar-bg": "#21222c",
@@ -813,6 +857,37 @@ tr:nth-child(even) td { background: var(--table-row-alt); }
   pointer-events: none;
 }
 #reload-badge.show { opacity: 1; }
+/* Persistent zoom control (bottom-left, next to the brand badge) */
+.zoom-control {
+  position: fixed;
+  left: 14px;
+  bottom: 40px;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-secondary) 92%, transparent);
+  font-size: 11px;
+  user-select: none;
+}
+.zoom-btn {
+  width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 14px; line-height: 1;
+}
+.zoom-btn:hover { background: var(--bg-tertiary); color: var(--text); }
+.zoom-level {
+  min-width: 38px; text-align: center;
+  color: var(--text-muted); font-weight: 600;
+  cursor: pointer;
+}
+.zoom-level:hover { color: var(--text); }
 /* Highlights */
 mark.mdhtml-hl {
   background: var(--accent-dim);
@@ -830,6 +905,37 @@ mark.pending-hl {
   color: inherit;
   border-radius: 2px;
   padding: 1px 0;
+}
+/* AI activity: a highlight the agent has "claimed" pulses yellow while it works;
+   when a response lands it flashes green, then settles back to normal. */
+mark.mdhtml-hl.ai-thinking {
+  animation: ai-thinking-pulse 1.1s ease-in-out infinite;
+  border-bottom-color: var(--think);
+}
+@keyframes ai-thinking-pulse {
+  0%, 100% { background: color-mix(in srgb, var(--think) 14%, transparent); }
+  50% { background: color-mix(in srgb, var(--think) 42%, transparent); }
+}
+mark.mdhtml-hl.ai-responded {
+  animation: ai-responded-flash 1.6s ease-out;
+}
+@keyframes ai-responded-flash {
+  0% { background: color-mix(in srgb, var(--sugg) 55%, transparent); border-bottom-color: var(--sugg); }
+  100% { background: var(--accent-dim); }
+}
+/* Right-panel card echoes the same states so it's visible even when the
+   highlighted passage is scrolled off-screen. */
+.hl-card.ai-thinking { border-color: var(--think); box-shadow: 0 0 0 1px color-mix(in srgb, var(--think) 40%, transparent); }
+.hl-card-aistate {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-left: auto;
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--think);
+}
+.hl-card-aistate::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--think);
+  animation: ai-thinking-pulse 1.1s ease-in-out infinite;
 }
 mark.mdhtml-hl:hover {
   background: rgba(247,129,102,0.25);
@@ -1431,6 +1537,9 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       var cardClass = 'hl-card';
       if (h.completed) cardClass += ' completed';
       else if (h.resolved) cardClass += ' resolved';
+      if (h.aiState === 'thinking') cardClass += ' ai-thinking';
+
+      var aiStateHtml = h.aiState === 'thinking' ? '<span class="hl-card-aistate">thinking</span>' : '';
 
       var statusHtml = '';
       if (h.completed) statusHtml = '<span class="hl-card-status completed">\\u2713 Done</span>';
@@ -1483,7 +1592,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
       html += '<div class="' + cardClass + '" data-hl-id="' + h.id + '">'
         + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
-        + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span>' + statusHtml + resolveBtn + '</div>'
+        + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span>' + aiStateHtml + statusHtml + resolveBtn + '</div>'
         + threadHtml
         + suggHtml
         + replyHtml
@@ -1676,8 +1785,36 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       clearHighlights();
       hls.forEach(applyHighlight);
       applyInlineSuggestions(hls);
+      applyAiActivity(hls);
       renderPanel(hls);
     }).catch(function(){});
+  }
+
+  // AI activity overlays: pulse a highlight yellow while the agent has claimed
+  // it ("thinking"), and flash it green the moment a new AI response (comment
+  // or suggestion) arrives for it.
+  var prevAiSig = null;
+  function aiSignature(h) {
+    var aiMsgs = (h.messages || []).filter(function(m){ return m.author === 'ai'; }).length;
+    var suggs = (h.suggestions || []).length;
+    return aiMsgs + ':' + suggs;
+  }
+  function applyAiActivity(hls) {
+    var newSig = {};
+    hls.forEach(function(h){
+      newSig[h.id] = aiSignature(h);
+      var marks = content.querySelectorAll('mark.mdhtml-hl[data-hl-id="' + h.id + '"]');
+      if (h.aiState === 'thinking') {
+        marks.forEach(function(m){ m.classList.add('ai-thinking'); });
+      } else if (prevAiSig && prevAiSig[h.id] !== undefined && prevAiSig[h.id] !== newSig[h.id]) {
+        marks.forEach(function(m){
+          m.classList.add('ai-responded');
+          (function(mk){ setTimeout(function(){ mk.classList.remove('ai-responded'); }, 1600); })(m);
+        });
+        if (window.__spotlightFlash) window.__spotlightFlash('AI responded');
+      }
+    });
+    prevAiSig = newSig;
   }
 
   // In-place document refresh: fetch freshly rendered fragments and patch the
@@ -1900,6 +2037,43 @@ ${tocHtml}
     </div>
   </nav>` : "";
 
+  // App-level zoom that persists in localStorage and reapplies on every load,
+  // so a hard refresh keeps your zoom. Intercepts Cmd/Ctrl +/-/0 so it is the
+  // reliable zoom regardless of the browser's own per-origin zoom memory.
+  const zoomScript = `<div class="zoom-control" aria-label="Zoom">
+  <div class="zoom-btn" id="zoom-out" title="Zoom out (Ctrl -)">\\u2212</div>
+  <div class="zoom-level" id="zoom-level" title="Reset zoom (Ctrl 0)">100%</div>
+  <div class="zoom-btn" id="zoom-in" title="Zoom in (Ctrl +)">+</div>
+</div>
+<script>
+(function(){
+  var KEY = 'spotlight-md:zoom';
+  var STEPS = [0.5,0.67,0.75,0.8,0.9,1,1.1,1.25,1.5,1.75,2,2.5,3];
+  var z = parseFloat(localStorage.getItem(KEY));
+  if (!z || isNaN(z)) z = 1;
+  var levelEl = document.getElementById('zoom-level');
+  function nearestIndex(v){ var bi=0,bd=Infinity; for(var i=0;i<STEPS.length;i++){var d=Math.abs(STEPS[i]-v); if(d<bd){bd=d;bi=i;}} return bi; }
+  function apply(){
+    document.documentElement.style.zoom = z;
+    if (levelEl) levelEl.textContent = Math.round(z*100) + '%';
+    try { localStorage.setItem(KEY, String(z)); } catch(e){}
+  }
+  function step(dir){ var i=nearestIndex(z)+dir; i=Math.max(0,Math.min(STEPS.length-1,i)); z=STEPS[i]; apply(); }
+  function reset(){ z=1; apply(); }
+  apply();
+  var zi=document.getElementById('zoom-in'), zo=document.getElementById('zoom-out');
+  if(zi) zi.addEventListener('click', function(){ step(1); });
+  if(zo) zo.addEventListener('click', function(){ step(-1); });
+  if(levelEl) levelEl.addEventListener('click', reset);
+  window.addEventListener('keydown', function(e){
+    if (!(e.metaKey || e.ctrlKey)) return;
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); step(1); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); step(-1); }
+    else if (e.key === '0') { e.preventDefault(); reset(); }
+  });
+})();
+</script>`;
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1925,6 +2099,7 @@ ${frontmatterHtml ? frontmatterHtml + "\n" : ""}${bodyHtml}
 ${reloadScript}
 ${scrollSpy}
 ${highlightScript}
+${zoomScript}
 <div class="spotlight-brand" aria-label="spotlight-md version ${escapeHtml(VERSION)}">spotlight-md <span>v${escapeHtml(VERSION)}</span></div>
 </body>
 </html>`;
@@ -2324,6 +2499,15 @@ Choose a stable agent ID for this run, for example codex-session-abc123.
 
      spotlight-md get-highlight-details --session-id sp-… --highlight-id hl-… --json
 
+   As soon as you start working on a highlight, claim it so the reviewer sees
+   a live "thinking" pulse on that exact passage:
+
+     spotlight-md ai-agent-claim --session-id sp-… --highlight-id hl-… --agent-id codex-session-abc123 --json
+
+   The claim is released automatically when you reply, suggest an edit, or
+   complete the highlight (the passage then flashes green for the reviewer).
+   Release it manually with --release if you decide not to act on it.
+
 3. Edit the Markdown source to address the human’s request. Preserve the
    surrounding intent; do not change unrelated material.
 
@@ -2561,6 +2745,7 @@ try {
       if (!opts.highlightId || !opts.comment) throw new Error("--highlight-id and --comment are required");
       const result = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
       if (!result) throw new Error(`highlight ${opts.highlightId} not found`);
+      releaseAiClaim(session.id, opts.highlightId);
       if (opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
       emit(result);
     } else if (opts.command === "suggest-edit") {
@@ -2572,14 +2757,20 @@ try {
         const r = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
         message = r ? r.message : undefined;
       }
+      if (opts.highlightId) releaseAiClaim(session.id, opts.highlightId);
       if (opts.highlightId && opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
       emit({ suggestion, message });
     } else if (opts.command === "list-suggestions") {
       emit(loadSuggestions(session.id, opts.highlightId ? { highlightId: opts.highlightId } : {}));
+    } else if (opts.command === "ai-agent-claim") {
+      if (!opts.highlightId) throw new Error("--highlight-id is required");
+      if (!setAiClaim(session.id, opts.highlightId, opts.agentId, !opts.release)) throw new Error(`highlight ${opts.highlightId} not found`);
+      emit({ ok: true, highlightId: opts.highlightId, state: opts.release ? "idle" : "thinking" });
     } else if (opts.command === "ai-agent-mark-as-completed") {
       if (!opts.highlightId || !opts.comment) throw new Error("--highlight-id and --comment are required");
       const result = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
       if (!result || !setHighlightResolved(session.id, opts.highlightId, true, true)) throw new Error(`highlight ${opts.highlightId} not found`);
+      releaseAiClaim(session.id, opts.highlightId);
       if (opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
       emit({ ok: true, highlightId: opts.highlightId, status: "completed" });
     } else if (opts.command === "close-session") {

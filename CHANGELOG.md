@@ -2,6 +2,13 @@
 
 All notable changes to spotlight-md follow [Semantic Versioning](https://semver.org/).
 
+## 0.3.0 — 2026-08-16
+
+- Added a persistent zoom control: zoom in/out (buttons or Ctrl/Cmd +/−/0) is remembered in `localStorage` and reapplied on every load, so a hard refresh keeps your zoom.
+- Added live "AI is working" indicators. An agent claims a highlight with `ai-agent-claim` while it works, pulsing that exact passage yellow (and marking its panel card). The claim releases automatically when the agent replies, suggests an edit, or completes it, flashing the passage green. Release manually with `--release`.
+- Fixed the note popup clearing the selected passage: the selection is now held with a temporary marker until the highlight is saved or dismissed.
+- Fixed suggestion anchors failing to apply when the markdown source was hard-wrapped across lines; failed approvals now surface a message instead of silently doing nothing.
+
 ## 0.2.0 — 2026-08-16
 
 - Added live suggested edits: an AI agent can propose a change with `suggest-edit --anchor --replacement`, and the reviewer approves or dismisses it in the browser (Google-Docs style). Approving splices the change into the markdown source; dismissing leaves it untouched. Suggestions appear inline on hover (no reflow) and as a diff card in the panel.

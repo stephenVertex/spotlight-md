@@ -237,6 +237,48 @@ test("suggested edits match anchors across markdown line wrapping", async (t) =>
   assert.doesNotMatch(after, /nail polish remover/);
 });
 
+test("ai-agent-claim surfaces a thinking state that a response clears", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-claim-"));
+  const inputPath = join(dir, "doc.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  const url = `http://127.0.0.1:${port}`;
+  writeFileSync(inputPath, "# Doc\n\nA passage to review.\n");
+
+  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
+    stdio: "ignore", env: { ...process.env, ...env },
+  });
+  t.after(async () => { await stop(child); rmSync(dir, { recursive: true, force: true }); });
+  await waitForServer(url, child);
+
+  const session = await (await fetch(`${url}/__session__`)).json();
+  const highlight = await (await fetch(`${url}/__highlights__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "A passage to review.", note: "look at this" }),
+  })).json();
+
+  // Initially no AI state.
+  let hls = await (await fetch(`${url}/__highlights__`)).json();
+  assert.equal(hls[0].aiState, null);
+
+  // Claiming marks it as thinking in the browser payload.
+  assert.equal(cli(["ai-agent-claim", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--json"], env).status, 0);
+  hls = await (await fetch(`${url}/__highlights__`)).json();
+  assert.equal(hls[0].aiState, "thinking");
+
+  // Responding with a comment auto-releases the claim.
+  assert.equal(cli(["add-comment", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--comment", "done", "--json"], env).status, 0);
+  hls = await (await fetch(`${url}/__highlights__`)).json();
+  assert.equal(hls[0].aiState, null);
+
+  // Claim then explicitly release.
+  cli(["ai-agent-claim", "--session-id", session.id, "--highlight-id", highlight.id, "--json"], env);
+  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, "thinking");
+  cli(["ai-agent-claim", "--session-id", session.id, "--highlight-id", highlight.id, "--release", "--json"], env);
+  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, null);
+});
+
 test("prime documents the suggest-edit workflow for agents", () => {
   const result = cli(["prime"], {});
   assert.equal(result.status, 0, result.stderr);
