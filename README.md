@@ -1,8 +1,8 @@
 # spotlight-md
 
-Version: **0.1.1**
+Version: **0.2.0**
 
-Dark-themed markdown viewer with live reload, sidebar TOC, and highlight annotations for AI-assisted document review.
+Dark-themed markdown viewer with live reload, sidebar TOC, highlight annotations, and live AI-suggested edits for AI-assisted document review.
 
 ## Install
 
@@ -33,6 +33,8 @@ spotlight-md --no-open --auto file.md   Don't auto-open browser
 spotlight-md list-highlights --session-id sp-… --json
 spotlight-md get-new-comments --session-id sp-… --agent-id codex-… --wait --json
 spotlight-md add-comment --session-id sp-… --highlight-id hl-… --agent-id codex-… --comment "Addressed it"
+spotlight-md suggest-edit --session-id sp-… --highlight-id hl-… --anchor "old text" --replacement "new text" --comment "Rephrased"
+spotlight-md list-suggestions --session-id sp-… --json
 spotlight-md ai-agent-mark-as-completed --session-id sp-… --highlight-id hl-… --comment "Completed"
 spotlight-md close-session --session-id sp-…
 spotlight-md --version
@@ -67,7 +69,20 @@ If the document begins with a metadata block of `**Label:** value` lines after t
 
 ### Live reload
 
-In `--auto` mode, the server watches the markdown file. When you (or an AI agent) save changes, the browser reloads automatically via Server-Sent Events.
+In `--auto` mode, the server watches the markdown file. When you (or an AI agent) save changes, the page updates **in place** via Server-Sent Events — no full reload — so your scroll position, zoom, text selection, and applied highlights all survive the update. The server also watches the highlight database, so comments and suggestions an AI agent makes via the CLI appear in the browser instantly.
+
+### Suggested edits
+
+An AI agent can propose a change instead of editing the document directly:
+
+```bash
+spotlight-md suggest-edit --session-id sp-… --highlight-id hl-… \
+  --anchor "the exact text to replace" \
+  --replacement "the improved text" \
+  --comment "Acknowledged — here is a simpler phrasing."
+```
+
+The suggestion appears live in the browser, Google-Docs style: the highlighted passage gains a dashed underline, and hovering it (or opening its panel card) reveals a before/after diff with **Approve** and **Dismiss** buttons. The hover preview floats over the text so nothing reflows. Approving splices the change into the markdown source and updates the page in place; dismissing leaves the document untouched. The conversation thread stays open the whole time, so the human and AI can keep talking about a passage while the AI proposes revisions.
 
 ### Highlights
 

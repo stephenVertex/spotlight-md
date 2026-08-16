@@ -136,6 +136,82 @@ test("global service sessions support agent cursors, completion, and close summa
   assert.match(result.stdout, /Completed as requested/);
 });
 
+test("suggested edits: propose via CLI, approve splices the source, reject leaves it untouched", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-suggest-"));
+  const inputPath = join(dir, "doc.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  const url = `http://127.0.0.1:${port}`;
+  writeFileSync(inputPath, "# Doc\n\nThe quick brown fox.\n\nA second sentence stays put.\n");
+
+  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
+    stdio: "ignore",
+    env: { ...process.env, ...env },
+  });
+  t.after(async () => {
+    await stop(child);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await waitForServer(url, child);
+
+  const session = await (await fetch(`${url}/__session__`)).json();
+  const highlight = await (await fetch(`${url}/__highlights__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "The quick brown fox.", sectionId: "doc", sectionTitle: "Doc", note: "rephrase" }),
+  })).json();
+
+  // Propose a suggested edit tied to the highlight, with a thread comment.
+  let result = cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
+    "--anchor", "The quick brown fox.", "--replacement", "A swift auburn fox leapt.",
+    "--comment", "Acknowledged, rephrasing.", "--agent-id", "codex-test", "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  const proposed = JSON.parse(result.stdout);
+  assert.match(proposed.suggestion.id, /^sg-[a-f0-9]{10}$/);
+  assert.equal(proposed.suggestion.status, "pending");
+  assert.equal(proposed.message.text, "Acknowledged, rephrasing.");
+
+  // The suggestion rides along with the highlight in the browser payload.
+  let hls = await (await fetch(`${url}/__highlights__`)).json();
+  assert.equal(hls[0].suggestions.length, 1);
+  assert.equal(hls[0].suggestions[0].replacement, "A swift auburn fox leapt.");
+
+  // Rejecting a suggestion leaves the document untouched.
+  const second = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
+    "--anchor", "A second sentence stays put.", "--replacement", "SHOULD NOT APPLY", "--json"], env).stdout);
+  const rejectRes = await fetch(`${url}/__suggestions__/${second.suggestion.id}/reject`, { method: "PATCH" });
+  assert.equal(rejectRes.status, 200);
+  assert.equal((await rejectRes.json()).status, "rejected");
+  assert.match(readFileSync(inputPath, "utf8"), /A second sentence stays put\./);
+  assert.doesNotMatch(readFileSync(inputPath, "utf8"), /SHOULD NOT APPLY/);
+
+  // Approving splices anchor→replacement into the markdown source.
+  const acceptRes = await fetch(`${url}/__suggestions__/${proposed.suggestion.id}/accept`, { method: "PATCH" });
+  assert.equal(acceptRes.status, 200);
+  assert.equal((await acceptRes.json()).status, "accepted");
+  const after = readFileSync(inputPath, "utf8");
+  assert.match(after, /A swift auburn fox leapt\./);
+  assert.doesNotMatch(after, /The quick brown fox\./);
+
+  // Once accepted it is no longer pending, so it drops off the highlight.
+  hls = await (await fetch(`${url}/__highlights__`)).json();
+  assert.equal(hls[0].suggestions.length, 0);
+
+  // Approving a suggestion whose anchor no longer exists fails cleanly.
+  const stale = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
+    "--anchor", "text that is not present", "--replacement", "x", "--json"], env).stdout);
+  const staleRes = await fetch(`${url}/__suggestions__/${stale.suggestion.id}/accept`, { method: "PATCH" });
+  assert.equal(staleRes.status, 409);
+});
+
+test("prime documents the suggest-edit workflow for agents", () => {
+  const result = cli(["prime"], {});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /suggest-edit --session-id/);
+  assert.match(result.stdout, /--anchor/);
+  assert.match(result.stdout, /--replacement/);
+});
+
 test("selection popup submit handler receives its event instead of referencing an undeclared variable", () => {
   const source = readFileSync(toolPath, "utf8");
   assert.equal(
@@ -160,9 +236,10 @@ test("prime teaches agents the session-based collaborative review loop", () => {
 });
 
 test("reports the semantic version from the release source of truth", () => {
+  const expected = readFileSync(resolve(import.meta.dirname, "..", "VERSION"), "utf8").trim();
   const result = cli(["--version"], {});
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "spotlight-md 0.1.1");
+  assert.equal(result.stdout.trim(), `spotlight-md ${expected}`);
 });
 
 test("rendered pages include a fixed spotlight-md version badge", () => {

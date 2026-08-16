@@ -18,11 +18,11 @@ const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, wait: false, json: false, newSession: false };
+  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
-    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
+    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
@@ -36,6 +36,10 @@ function parseArgs(argv) {
     else if (a.startsWith("--agent-id=")) opts.agentId = a.slice(11);
     else if (a === "--comment") opts.comment = argv[++i];
     else if (a.startsWith("--comment=")) opts.comment = a.slice(10);
+    else if (a === "--anchor") opts.anchor = argv[++i];
+    else if (a.startsWith("--anchor=")) opts.anchor = a.slice(9);
+    else if (a === "--replacement") opts.replacement = argv[++i];
+    else if (a.startsWith("--replacement=")) opts.replacement = a.slice(14);
     else if (a === "--wait") opts.wait = true;
     else if (a === "--json") opts.json = true;
     else if (a === "--new-session") opts.newSession = true;
@@ -53,6 +57,8 @@ Usage:
   spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--json]
   spotlight-md ai-agent-mark-read --session-id ID --highlight-id ID --agent-id ID
   spotlight-md add-comment --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
+  spotlight-md suggest-edit --session-id ID --highlight-id ID --anchor TEXT --replacement TEXT [--comment TEXT] [--agent-id ID]
+  spotlight-md list-suggestions --session-id ID [--highlight-id ID] [--json]
   spotlight-md ai-agent-mark-as-completed --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
   spotlight-md close-session --session-id ID
   spotlight-md reopen-session --session-id ID
@@ -116,6 +122,18 @@ function openDb() {
       last_read_seq INTEGER NOT NULL DEFAULT -1, read_at TEXT NOT NULL,
       PRIMARY KEY (session_id, agent_id, highlight_id)
     );
+    CREATE TABLE IF NOT EXISTS suggestions (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      highlight_id TEXT,
+      anchor TEXT NOT NULL,
+      replacement TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      agent_id TEXT,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_suggestions_session ON suggestions(session_id, status);
   `);
   return db;
 }
@@ -235,6 +253,104 @@ function setHighlightResolved(sessionId, id, resolved, completed = false) {
   } finally {
     db.close();
   }
+}
+
+function suggestionRow(r) {
+  return {
+    id: r.id,
+    highlightId: r.highlight_id || undefined,
+    anchor: r.anchor,
+    replacement: r.replacement,
+    status: r.status,
+    agentId: r.agent_id || undefined,
+    createdAt: r.created_at,
+    resolvedAt: r.resolved_at || undefined,
+  };
+}
+
+function loadSuggestions(sessionId, { status, highlightId } = {}) {
+  const db = openDb();
+  try {
+    let sql = "SELECT id, highlight_id, anchor, replacement, status, agent_id, created_at, resolved_at FROM suggestions WHERE session_id = ?";
+    const params = [sessionId];
+    if (status) { sql += " AND status = ?"; params.push(status); }
+    if (highlightId) { sql += " AND highlight_id = ?"; params.push(highlightId); }
+    sql += " ORDER BY created_at";
+    return db.prepare(sql).all(...params).map(suggestionRow);
+  } finally { db.close(); }
+}
+
+function getSuggestion(sessionId, id) {
+  const db = openDb();
+  try {
+    const r = db.prepare("SELECT id, highlight_id, anchor, replacement, status, agent_id, created_at, resolved_at FROM suggestions WHERE id = ? AND session_id = ?").get(id, sessionId);
+    return r ? suggestionRow(r) : null;
+  } finally { db.close(); }
+}
+
+function addSuggestion(sessionId, { highlightId, anchor, replacement, agentId }) {
+  requireActiveSession(sessionId);
+  const db = openDb();
+  try {
+    if (highlightId) {
+      const hl = db.prepare("SELECT id FROM highlights WHERE id = ? AND session_id = ?").get(highlightId, sessionId);
+      if (!hl) throw new Error(`highlight ${highlightId} not found`);
+    }
+    const id = genId("sg-");
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suggestions (id, session_id, highlight_id, anchor, replacement, status, agent_id, created_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(id, sessionId, highlightId || null, anchor, replacement, agentId || null, now);
+    return { id, highlightId: highlightId || undefined, anchor, replacement, status: "pending", agentId: agentId || undefined, createdAt: now };
+  } finally { db.close(); }
+}
+
+function setSuggestionStatus(sessionId, id, status) {
+  requireActiveSession(sessionId);
+  const db = openDb();
+  try {
+    const existing = db.prepare("SELECT id FROM suggestions WHERE id = ? AND session_id = ?").get(id, sessionId);
+    if (!existing) return null;
+    db.prepare("UPDATE suggestions SET status = ?, resolved_at = ? WHERE id = ?").run(status, status === "pending" ? null : new Date().toISOString(), id);
+    return getSuggestion(sessionId, id);
+  } finally { db.close(); }
+}
+
+// Accept a suggestion: splice its anchor→replacement into the raw markdown of
+// the session's document (first verbatim occurrence), then mark it accepted.
+// Returns { suggestion, applied: true } on success, or { error } describing why
+// the splice could not be made so the caller can surface it.
+function acceptSuggestion(sessionId, id) {
+  const session = requireActiveSession(sessionId);
+  const suggestion = getSuggestion(sessionId, id);
+  if (!suggestion) return { error: "not found" };
+  if (suggestion.status !== "pending") return { error: `suggestion already ${suggestion.status}` };
+  let raw;
+  try { raw = readFileSync(session.path, "utf8"); }
+  catch (e) { return { error: `cannot read document: ${e.message}` }; }
+  const idx = raw.indexOf(suggestion.anchor);
+  if (idx === -1) {
+    return { error: "anchor text not found in the document; it may have changed since the suggestion was made" };
+  }
+  const updated = raw.slice(0, idx) + suggestion.replacement + raw.slice(idx + suggestion.anchor.length);
+  try { writeFileSync(session.path, updated); }
+  catch (e) { return { error: `cannot write document: ${e.message}` }; }
+  const applied = setSuggestionStatus(sessionId, id, "accepted");
+  return { suggestion: applied, applied: true };
+}
+
+// Attach pending suggestions to their highlights for the browser payload.
+function loadHighlightsWithSuggestions(sessionId) {
+  const highlights = loadHighlights(sessionId);
+  const pending = loadSuggestions(sessionId, { status: "pending" });
+  const byHl = new Map();
+  for (const s of pending) {
+    if (!s.highlightId) continue;
+    if (!byHl.has(s.highlightId)) byHl.set(s.highlightId, []);
+    byHl.get(s.highlightId).push(s);
+  }
+  return highlights.map((h) => ({ ...h, suggestions: byHl.get(h.id) || [] }));
 }
 
 function markRead(sessionId, id, agentId) {
@@ -414,6 +530,8 @@ const THEMES = {
     "--quote-text": "#8b949e",
     "--accent": "#f78166",
     "--accent-dim": "rgba(247,129,102,0.15)",
+    "--sugg": "#3fb950",
+    "--sugg-del": "#f85149",
     "--table-header-bg": "#1c2128",
     "--table-row-alt": "#161b22",
     "--sidebar-bg": "#161b22",
@@ -433,6 +551,8 @@ const THEMES = {
     "--quote-text": "#6272a4",
     "--accent": "#bd93f9",
     "--accent-dim": "rgba(189,147,249,0.15)",
+    "--sugg": "#50fa7b",
+    "--sugg-del": "#ff5555",
     "--table-header-bg": "#44475a",
     "--table-row-alt": "#21222c",
     "--sidebar-bg": "#21222c",
@@ -949,6 +1069,102 @@ mark.mdhtml-hl:hover {
 .hl-add-reply:hover { color: var(--accent); }
 .hl-panel::-webkit-scrollbar { width: 6px; }
 .hl-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Suggested edits ─────────────────────────────────────────────────────── */
+/* A highlight with a pending suggestion gets a distinct dashed underline and a
+   subtle pencil affordance, without changing the surrounding layout. */
+mark.mdhtml-hl.has-suggestion {
+  background: color-mix(in srgb, var(--sugg) 16%, transparent);
+  border-bottom: 2px dashed var(--sugg);
+  cursor: help;
+}
+mark.mdhtml-hl.has-suggestion::after {
+  content: "\\270e";
+  font-size: 0.75em;
+  vertical-align: super;
+  margin-left: 2px;
+  color: var(--sugg);
+  opacity: 0.85;
+}
+
+/* Floating popover anchored to the highlighted passage (no reflow) */
+.sugg-popover {
+  position: absolute;
+  z-index: 50;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  background: var(--bg-secondary);
+  border: 1px solid var(--sugg);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+  padding: 12px;
+  font-size: 13px;
+  animation: sugg-pop 0.12s ease-out;
+}
+@keyframes sugg-pop { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.sugg-popover-label, .hl-suggestion-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--sugg);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.sugg-popover-diff, .hl-suggestion-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+.sugg-del {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--sugg-del) 80%, transparent);
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--sugg-del) 12%, transparent);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.sugg-ins {
+  color: var(--text);
+  background: color-mix(in srgb, var(--sugg) 18%, transparent);
+  border-left: 2px solid var(--sugg);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.sugg-popover-actions, .hl-suggestion-actions {
+  display: flex;
+  gap: 6px;
+}
+.sugg-btn {
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  user-select: none;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.sugg-btn:hover { color: var(--text); border-color: var(--sugg); }
+.sugg-btn.accept {
+  color: #fff;
+  background: var(--sugg);
+  border-color: var(--sugg);
+  font-weight: 600;
+}
+.sugg-btn.accept:hover { filter: brightness(1.08); }
+
+/* Suggestion card inside the right-hand panel */
+.hl-suggestion {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--sugg) 50%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--sugg) 7%, var(--bg-tertiary));
+}
+
 /* Mobile */
 @media (max-width: 1100px) {
   .hl-panel { display: none; }
@@ -961,26 +1177,21 @@ mark.mdhtml-hl:hover {
 
 function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName) {
   const reloadScript = autoMode
-    ? `<div id="reload-badge">Reloading…</div>
+    ? `<div id="reload-badge">Updated</div>
 <script>
 (function(){
+  // The badge briefly flashes when the document updates in place. The actual
+  // live-update logic (SSE + DOM patching) lives in the highlight script so it
+  // can re-apply highlights after patching. Here we just expose the flash.
   var badge = document.getElementById('reload-badge');
-  function showBadge(){ badge.classList.add('show'); }
-  try {
-    var es = new EventSource('/__reload__');
-    es.addEventListener('reload', function(){
-      showBadge();
-      setTimeout(function(){ location.reload(); }, 200);
-    });
-  } catch(e){
-    setInterval(function(){
-      fetch('/__mtime__').then(r=>r.text()).then(function(t){
-        if(window._mtime && t !== window._mtime){ showBadge(); setTimeout(function(){ location.reload(); }, 200); }
-        window._mtime = t;
-      }).catch(function(){});
-    }, 1500);
-    fetch('/__mtime__').then(r=>r.text()).then(function(t){ window._mtime = t; });
-  }
+  var hideTimer = null;
+  window.__spotlightFlash = function(label){
+    if (!badge) return;
+    if (label) badge.textContent = label;
+    badge.classList.add('show');
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(function(){ badge.classList.remove('show'); }, 1100);
+  };
 })();
 </script>`
     : "";
@@ -988,38 +1199,47 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   const scrollSpy = tocHtml ? `
 <script>
 (function(){
-  var links = document.querySelectorAll('.toc-link');
-  var headings = [];
-  links.forEach(function(link){
-    var h = document.getElementById(link.dataset.target);
-    if (h) headings.push({ el: h, link: link });
-  });
-  if (headings.length === 0) return;
   var activeLink = null;
-  function onScroll() {
-    var scrollY = window.scrollY + 80;
-    var current = null;
-    for (var i = 0; i < headings.length; i++) {
-      if (headings[i].el.offsetTop <= scrollY) {
-        current = headings[i];
-      } else { break; }
-    }
-    if (current && current.link !== activeLink) {
-      if (activeLink) activeLink.classList.remove('active');
-      current.link.classList.add('active');
-      activeLink = current.link;
-      // Scroll the sidebar to keep the active item visible
-      var sidebar = document.querySelector('.sidebar');
-      var linkTop = current.link.offsetTop;
-      var linkBottom = linkTop + current.link.offsetHeight;
-      var viewTop = sidebar.scrollTop;
-      var viewBottom = viewTop + sidebar.clientHeight;
-      if (linkTop < viewTop + 60) sidebar.scrollTop = linkTop - 60;
-      else if (linkBottom > viewBottom - 60) sidebar.scrollTop = linkBottom - sidebar.clientHeight + 60;
-    }
-  }
-  window.addEventListener('scroll', onScroll, { passive: true });
-  onScroll();
+  var onScroll = null;
+  // (Re)bind scroll-spy to the current .toc-link set. Called on load and again
+  // after an in-place content update replaces the sidebar TOC.
+  window.__initScrollSpy = function(){
+    var links = document.querySelectorAll('.toc-link');
+    var headings = [];
+    links.forEach(function(link){
+      var h = document.getElementById(link.dataset.target);
+      if (h) headings.push({ el: h, link: link });
+    });
+    if (onScroll) window.removeEventListener('scroll', onScroll);
+    activeLink = null;
+    if (headings.length === 0) { onScroll = null; return; }
+    onScroll = function() {
+      var scrollY = window.scrollY + 80;
+      var current = null;
+      for (var i = 0; i < headings.length; i++) {
+        if (headings[i].el.offsetTop <= scrollY) {
+          current = headings[i];
+        } else { break; }
+      }
+      if (current && current.link !== activeLink) {
+        if (activeLink) activeLink.classList.remove('active');
+        current.link.classList.add('active');
+        activeLink = current.link;
+        // Scroll the sidebar to keep the active item visible
+        var sidebar = document.querySelector('.sidebar');
+        if (!sidebar) return;
+        var linkTop = current.link.offsetTop;
+        var linkBottom = linkTop + current.link.offsetHeight;
+        var viewTop = sidebar.scrollTop;
+        var viewBottom = viewTop + sidebar.clientHeight;
+        if (linkTop < viewTop + 60) sidebar.scrollTop = linkTop - 60;
+        else if (linkBottom > viewBottom - 60) sidebar.scrollTop = linkBottom - sidebar.clientHeight + 60;
+      }
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  };
+  window.__initScrollSpy();
 })();
 </script>` : "";
 
@@ -1164,6 +1384,24 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         threadHtml += '</div>';
       }
 
+      // Pending suggested edits (rendered as an accept/reject diff card)
+      var suggHtml = '';
+      var pending = (h.suggestions || []).filter(function(s){ return s.status === 'pending'; });
+      for (var k = 0; k < pending.length; k++) {
+        var s = pending[k];
+        suggHtml += '<div class="hl-suggestion" data-sugg-id="' + s.id + '">'
+          + '<div class="hl-suggestion-label">\\u270e Suggested edit</div>'
+          + '<div class="hl-suggestion-diff">'
+          +   '<span class="sugg-del">' + escapeText(s.anchor) + '</span>'
+          +   '<span class="sugg-ins">' + escapeText(s.replacement) + '</span>'
+          + '</div>'
+          + '<div class="hl-suggestion-actions">'
+          +   '<span class="sugg-btn accept" data-action="accept">\\u2713 Approve</span>'
+          +   '<span class="sugg-btn reject" data-action="reject">Dismiss</span>'
+          + '</div>'
+          + '</div>';
+      }
+
       // Reply link (only if not completed)
       var replyHtml = '';
       if (!h.completed) {
@@ -1174,6 +1412,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
         + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span>' + statusHtml + resolveBtn + '</div>'
         + threadHtml
+        + suggHtml
         + replyHtml
         + '</div>';
     }
@@ -1214,7 +1453,93 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
           openReplyBox(card, id);
         });
       }
+
+      // Suggestion approve/dismiss buttons
+      card.querySelectorAll('.hl-suggestion').forEach(function(sg){
+        var sid = sg.dataset.suggId;
+        sg.querySelectorAll('.sugg-btn').forEach(function(btn){
+          btn.addEventListener('click', function(e){
+            e.stopPropagation();
+            resolveSuggestion(sid, btn.dataset.action);
+          });
+        });
+      });
     });
+  }
+
+  // Approve (splice into the document) or dismiss a suggested edit.
+  function resolveSuggestion(sid, action) {
+    fetch('/__suggestions__/' + sid + '/' + action, { method: 'PATCH' })
+      .then(function(r){ return r.json(); })
+      .then(function(){
+        if (action === 'accept' && window.__spotlightFlash) window.__spotlightFlash('Applied');
+        loadAndApply();
+      })
+      .catch(function(){});
+  }
+
+  // -- Inline suggestion overlays: anchor a hover popover to the highlighted
+  //    passage so the reviewer sees the proposed change without the text
+  //    reflowing. The document text is never mutated until Approve is clicked.
+  function clearInlineSuggestions() {
+    content.querySelectorAll('mark.mdhtml-hl.has-suggestion').forEach(function(m){
+      m.classList.remove('has-suggestion');
+    });
+    var pop = document.getElementById('sugg-popover');
+    if (pop) pop.remove();
+  }
+
+  function applyInlineSuggestions(hls) {
+    hls.forEach(function(h){
+      var pending = (h.suggestions || []).filter(function(s){ return s.status === 'pending'; });
+      if (!pending.length) return;
+      var marks = content.querySelectorAll('mark.mdhtml-hl[data-hl-id="' + h.id + '"]');
+      if (!marks.length) return;
+      marks.forEach(function(m){ m.classList.add('has-suggestion'); });
+      // Attach hover to reveal the suggestion popover anchored above the mark.
+      marks.forEach(function(m){
+        m.addEventListener('mouseenter', function(){ showSuggPopover(m, pending[0]); });
+      });
+    });
+  }
+
+  var suggPopoverHideTimer = null;
+  function showSuggPopover(mark, sugg) {
+    var existing = document.getElementById('sugg-popover');
+    if (existing && existing.dataset.suggId === sugg.id) { if (suggPopoverHideTimer) { clearTimeout(suggPopoverHideTimer); suggPopoverHideTimer = null; } return; }
+    if (existing) existing.remove();
+    var pop = document.createElement('div');
+    pop.id = 'sugg-popover';
+    pop.className = 'sugg-popover';
+    pop.dataset.suggId = sugg.id;
+    pop.innerHTML = '<div class="sugg-popover-label">\\u270e Suggested edit</div>'
+      + '<div class="sugg-popover-diff"><span class="sugg-del">' + escapeText(sugg.anchor) + '</span>'
+      + '<span class="sugg-ins">' + escapeText(sugg.replacement) + '</span></div>'
+      + '<div class="sugg-popover-actions">'
+      +   '<span class="sugg-btn accept" data-action="accept">\\u2713 Approve</span>'
+      +   '<span class="sugg-btn reject" data-action="reject">Dismiss</span>'
+      + '</div>';
+    document.body.appendChild(pop);
+    var rect = mark.getBoundingClientRect();
+    var top = rect.top - pop.offsetHeight - 10;
+    if (top < 8) top = rect.bottom + 10; // flip below if no room above
+    var left = rect.left;
+    var maxLeft = window.innerWidth - pop.offsetWidth - 12;
+    if (left > maxLeft) left = maxLeft;
+    if (left < 8) left = 8;
+    pop.style.top = (top + window.scrollY) + 'px';
+    pop.style.left = (left + window.scrollX) + 'px';
+    pop.querySelectorAll('.sugg-btn').forEach(function(btn){
+      btn.addEventListener('click', function(e){
+        e.stopPropagation();
+        resolveSuggestion(sugg.id, btn.dataset.action);
+      });
+    });
+    function scheduleHide(){ suggPopoverHideTimer = setTimeout(function(){ if (pop.parentNode) pop.remove(); }, 260); }
+    function cancelHide(){ if (suggPopoverHideTimer) { clearTimeout(suggPopoverHideTimer); suggPopoverHideTimer = null; } }
+    pop.addEventListener('mouseenter', cancelHide);
+    pop.addEventListener('mouseleave', scheduleHide);
+    mark.addEventListener('mouseleave', scheduleHide);
   }
 
   function openReplyBox(card, id) {
@@ -1267,9 +1592,32 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   function loadAndApply() {
     fetch('/__highlights__').then(function(r){return r.json()}).then(function(hls){
+      clearInlineSuggestions();
       clearHighlights();
       hls.forEach(applyHighlight);
+      applyInlineSuggestions(hls);
       renderPanel(hls);
+    }).catch(function(){});
+  }
+
+  // In-place document refresh: fetch freshly rendered fragments and patch the
+  // DOM without a full navigation, so scroll position, zoom, and text
+  // selection all survive. Highlights and suggestions are re-applied after.
+  function patchContent() {
+    fetch('/__content__').then(function(r){return r.json()}).then(function(data){
+      var scrollY = window.scrollY;
+      if (data.title) {
+        document.title = data.title;
+        var docTitleEl = document.querySelector('.sidebar-header .doc-title');
+        if (docTitleEl) docTitleEl.textContent = data.title;
+      }
+      content.innerHTML = (data.frontmatterHtml ? data.frontmatterHtml + '\\n' : '') + (data.bodyHtml || '');
+      var toc = document.querySelector('.toc');
+      if (toc) toc.innerHTML = data.tocHtml || '';
+      window.scrollTo(0, scrollY);
+      if (window.__initScrollSpy) window.__initScrollSpy();
+      if (window.__spotlightFlash) window.__spotlightFlash('Updated');
+      loadAndApply();
     }).catch(function(){});
   }
 
@@ -1442,12 +1790,15 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     if (e.key === 'Escape') { removeSelPopup(); removeDelPopup(); }
   });
 
-  // -- SSE: listen for highlight updates --
+  // -- SSE: live updates. content-updated → patch the document in place;
+  //    highlights-updated → re-fetch annotations (covers CLI-driven changes
+  //    like an AI agent adding comments or suggestions). --
   try {
     var es = new EventSource('/__reload__');
-    es.addEventListener('highlights-updated', function(){
-      loadAndApply();
-    });
+    es.addEventListener('content-updated', function(){ patchContent(); });
+    es.addEventListener('highlights-updated', function(){ loadAndApply(); });
+    // Back-compat: an older server may still emit a plain reload event.
+    es.addEventListener('reload', function(){ patchContent(); });
   } catch(e) {}
 
   // -- Initial load --
@@ -1581,6 +1932,12 @@ function serveAuto(inputPath, opts, session) {
     }
   }
 
+  function broadcastContent() {
+    for (const client of sseClients) {
+      client.write("event: content-updated\ndata: {}\n\n");
+    }
+  }
+
   function readBody(req) {
     return new Promise((resolve) => {
       let data = "";
@@ -1615,9 +1972,15 @@ function serveAuto(inputPath, opts, session) {
       return;
     }
     if (pathname === "/__highlights__" && req.method === "GET") {
-      const hls = loadHighlights(session.id);
+      const hls = loadHighlightsWithSuggestions(session.id);
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(hls));
+      return;
+    }
+    // Rendered document fragments, for in-place (no-reload) live updates.
+    if (pathname === "/__content__" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ title: currentTitle, bodyHtml: currentHtml, frontmatterHtml: currentFrontmatter, tocHtml: currentToc }));
       return;
     }
     if (pathname === "/__highlights__" && req.method === "POST") {
@@ -1734,6 +2097,45 @@ function serveAuto(inputPath, opts, session) {
       return;
     }
 
+    // Suggestion accept: PATCH /__suggestions__/:id/accept
+    const suggAcceptMatch = pathname.match(/^\/__suggestions__\/([^/]+)\/accept$/);
+    if (suggAcceptMatch && req.method === "PATCH") {
+      const id = suggAcceptMatch[1];
+      let result;
+      try { result = acceptSuggestion(session.id, id); }
+      catch (e) { result = { error: e.message }; }
+      if (result.applied) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.suggestion));
+        broadcastHighlights();
+        // The file write will trigger the watcher → content-updated; nudge it
+        // immediately too so the browser feels instant.
+        rebuild();
+        writeStaticCopy();
+        broadcastContent();
+      } else {
+        res.writeHead(result.error === "not found" ? 404 : 409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: result.error || "could not apply suggestion" }));
+      }
+      return;
+    }
+
+    // Suggestion reject: PATCH /__suggestions__/:id/reject
+    const suggRejectMatch = pathname.match(/^\/__suggestions__\/([^/]+)\/reject$/);
+    if (suggRejectMatch && req.method === "PATCH") {
+      const id = suggRejectMatch[1];
+      const updated = setSuggestionStatus(session.id, id, "rejected");
+      if (updated) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(updated));
+        broadcastHighlights();
+      } else {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+      }
+      return;
+    }
+
     if (pathname === "/__mtime__") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(String(mtime));
@@ -1756,24 +2158,39 @@ function serveAuto(inputPath, opts, session) {
     }
   });
 
-  // Watch the file (polling for reliability on macOS/network drives)
+  // Watch the file (polling for reliability on macOS/network drives). On
+  // change we re-render and push the new fragments over SSE so the browser
+  // patches the DOM in place — no full reload, so scroll, zoom, text
+  // selection, and applied highlights all survive.
   let debounceTimer = null;
-  watchFile(inputPath, { interval: 500 }, (curr) => {
+  watchFile(inputPath, { interval: 300 }, (curr) => {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       rebuild();
       writeStaticCopy();
-      // Notify all connected browsers
-      for (const client of sseClients) {
-        client.write("event: reload\ndata: {}\n\n");
-      }
-    }, 150);
+      broadcastContent();
+    }, 120);
   });
+
+  // Watch the highlight database so annotations made out-of-process (an AI
+  // agent running the CLI: add-comment, suggest-edit, complete) appear in the
+  // browser live, without needing a document edit to trigger a refresh. WAL
+  // mode writes land in the -wal sidecar, so watch that; fall back to the db.
+  const dbPath = dbFilePath();
+  let dbDebounce = null;
+  const onDbChange = () => {
+    if (dbDebounce) clearTimeout(dbDebounce);
+    dbDebounce = setTimeout(() => broadcastHighlights(), 120);
+  };
+  watchFile(dbPath + "-wal", { interval: 300 }, onDbChange);
+  watchFile(dbPath, { interval: 500 }, onDbChange);
 
   report("  watching for changes…  (Ctrl-C to stop)\n");
 
   process.on("SIGINT", () => {
     unwatchFile(inputPath);
+    unwatchFile(dbPath + "-wal");
+    unwatchFile(dbPath);
     for (const c of sseClients) c.end();
     server.close();
     report("\n  stopped.");
@@ -1829,6 +2246,24 @@ Choose a stable agent ID for this run, for example codex-session-abc123.
 
    Adding a comment advances your read cursor. If you only inspected a thread,
    use ai-agent-mark-read instead.
+
+   Instead of editing the document directly, you can propose a *suggested edit*
+   the human approves or dismisses in the browser (Google-Docs style). This is
+   the preferred way to change prose the human highlighted, because they see the
+   exact before/after inline and stay in control:
+
+     spotlight-md suggest-edit --session-id sp-… --highlight-id hl-… \\
+       --anchor "the exact text to replace, verbatim from the markdown" \\
+       --replacement "the improved text" \\
+       --comment "Acknowledged — here is a simpler phrasing." --agent-id codex-session-abc123 --json
+
+   The --anchor MUST appear verbatim in the markdown source (read the file to
+   copy it exactly, including punctuation). On approval the tool splices
+   replacement in place and the browser updates live; on dismissal nothing
+   changes. --comment optionally posts a note into the thread in the same call.
+   The suggestion appears the instant you run the command — the human does not
+   need to reload. Use add-comment (not suggest-edit) when the answer is a
+   discussion rather than a concrete text change.
 
 5. Continue waiting. Do not complete a highlight merely because you replied.
    Complete it only when the human explicitly asks or the agreed workflow says
@@ -2041,6 +2476,19 @@ try {
       if (!result) throw new Error(`highlight ${opts.highlightId} not found`);
       if (opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
       emit(result);
+    } else if (opts.command === "suggest-edit") {
+      if (!opts.anchor || opts.replacement === null) throw new Error("--anchor and --replacement are required");
+      const suggestion = addSuggestion(session.id, { highlightId: opts.highlightId || null, anchor: opts.anchor, replacement: opts.replacement, agentId: opts.agentId });
+      // Optionally post the AI's note into the highlight thread in the same call.
+      let message;
+      if (opts.highlightId && opts.comment) {
+        const r = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
+        message = r ? r.message : undefined;
+      }
+      if (opts.highlightId && opts.agentId) markRead(session.id, opts.highlightId, opts.agentId);
+      emit({ suggestion, message });
+    } else if (opts.command === "list-suggestions") {
+      emit(loadSuggestions(session.id, opts.highlightId ? { highlightId: opts.highlightId } : {}));
     } else if (opts.command === "ai-agent-mark-as-completed") {
       if (!opts.highlightId || !opts.comment) throw new Error("--highlight-id and --comment are required");
       const result = addHighlightMessage(session.id, opts.highlightId, "ai", opts.comment, opts.agentId);
