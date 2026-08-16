@@ -823,6 +823,14 @@ mark.mdhtml-hl {
   cursor: pointer;
   transition: background 0.15s;
 }
+/* Temporary marker shown while the note popup is open, so the selected passage
+   stays visible after the input steals the browser's live text selection. */
+mark.pending-hl {
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  padding: 1px 0;
+}
 mark.mdhtml-hl:hover {
   background: rgba(247,129,102,0.25);
 }
@@ -1343,6 +1351,53 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     content.normalize();
   }
 
+  // -- Pending selection highlight: while the note popup is open, the browser
+  //    clears the live text selection as soon as the note input takes focus.
+  //    To keep the passage visible we wrap it in a temporary mark the instant
+  //    the popup opens, and unwrap it when the popup closes.
+  function clearPending() {
+    var marks = content.querySelectorAll('mark.pending-hl');
+    if (!marks.length) return;
+    marks.forEach(function(m){
+      var parent = m.parentNode;
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+    });
+    // Deliberately no normalize() here: it can collapse a live selection that
+    // is about to be wrapped. clearHighlights()/loadAndApply() normalize later.
+  }
+
+  function markPendingSelection() {
+    var sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    var range = sel.getRangeAt(0);
+    if (range.collapsed || !content.contains(range.commonAncestorContainer)) return;
+    var root = range.commonAncestorContainer;
+    if (root.nodeType === 3) root = root.parentNode;
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node){
+        if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+        var p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (p.closest('.hl-popup, .hl-delete-popup, .sidebar, .hl-panel')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    }, false);
+    var nodes = [], n;
+    while (n = walker.nextNode()) nodes.push(n);
+    nodes.forEach(function(node){
+      var s = (node === range.startContainer) ? range.startOffset : 0;
+      var e = (node === range.endContainer) ? range.endOffset : node.textContent.length;
+      if (s >= e) return;
+      node.splitText(e);
+      var mid = node.splitText(s);
+      var mark = document.createElement('mark');
+      mark.className = 'pending-hl';
+      mid.parentNode.insertBefore(mark, mid);
+      mark.appendChild(mid);
+    });
+  }
+
   function escapeText(s) {
     var d = document.createElement('div');
     d.textContent = s;
@@ -1678,6 +1733,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   // -- Selection popup --
   function removeSelPopup() {
     if (selPopup) { selPopup.remove(); selPopup = null; }
+    clearPending();
   }
 
   function showSelPopup(x, y, selection) {
@@ -1706,6 +1762,9 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     noteInput.style.outline = 'none';
     selPopup.appendChild(noteInput);
     selPopup.appendChild(btn);
+    // Mark the selected passage now, before focusing the input clears the
+    // browser's live selection, so the reviewer keeps seeing what they picked.
+    markPendingSelection();
     selPopup.addEventListener('mousedown', function(e){ e.preventDefault(); });
     function submit(event) {
       // Click handlers receive an event, but keyboard submission calls this
@@ -1728,6 +1787,9 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   function createHighlightFromSelection(selection, note) {
     if (!selection || !selection.text) return;
+    // Remove the temporary pending mark so the real highlight applies to clean
+    // DOM (the text was already captured into the selection object).
+    clearPending();
     var body = JSON.stringify({
       text: selection.text,
       sectionId: selection.sectionId,
