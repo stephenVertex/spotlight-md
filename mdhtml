@@ -1518,7 +1518,6 @@ function renderFile(inputPath) {
   }
 
   const body = result.stdout.trim();
-  const title = basename(inputPath, extname(inputPath));
 
   // Build frontmatter HTML
   const frontmatterHtml = frontmatter ? buildFrontmatterHtml(frontmatter) : "";
@@ -1526,6 +1525,11 @@ function renderFile(inputPath) {
   // Build TOC from rendered headings
   const tocEntries = extractToc(body);
   const tocHtml = buildTocHtml(tocEntries);
+
+  // Prefer the document's H1 as the page/tab title so tabs are findable;
+  // fall back to the filename when there's no heading to use.
+  const h1Entry = tocEntries.find((e) => e.level === 1);
+  const title = h1Entry ? h1Entry.text : basename(inputPath, extname(inputPath));
 
   return { title, html: body, frontmatterHtml, tocHtml };
 }
