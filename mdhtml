@@ -659,10 +659,11 @@ body {
   position: sticky;
   top: 0;
   width: var(--sidebar-w);
-  height: 100vh;
+  height: var(--col-height, 100vh);
   background: var(--sidebar-bg);
   border-right: 1px solid var(--border);
   overflow-y: auto;
+  overscroll-behavior: contain;
   flex-shrink: 0;
   padding: 24px 0 48px;
 }
@@ -1066,10 +1067,11 @@ mark.mdhtml-hl:hover {
   position: sticky;
   top: 0;
   width: 260px;
-  height: 100vh;
+  height: var(--col-height, 100vh);
   background: var(--sidebar-bg);
   border-left: 1px solid var(--border);
   overflow-y: auto;
+  overscroll-behavior: contain;
   flex-shrink: 0;
   padding: 24px 0 48px;
 }
@@ -2230,9 +2232,15 @@ ${tocHtml}
     // Expose the factor so fixed-position popups (which are scaled by the root
     // zoom) can divide viewport coordinates by it and land on the selection.
     window.__spotlightZoom = z;
+    // The sticky side columns use height:var(--col-height). Under root zoom,
+    // 100vh renders zoom× taller than the visible window, pushing the column
+    // (and its scrollbar) off-screen, so it can't scroll independently. Set the
+    // height to the visible viewport in layout units: innerHeight / zoom.
+    document.documentElement.style.setProperty('--col-height', Math.round(window.innerHeight / z) + 'px');
     if (levelEl) levelEl.textContent = Math.round(z*100) + '%';
     try { localStorage.setItem(KEY, String(z)); } catch(e){}
   }
+  window.addEventListener('resize', apply);
   function step(dir){ var i=nearestIndex(z)+dir; i=Math.max(0,Math.min(STEPS.length-1,i)); z=STEPS[i]; apply(); }
   function reset(){ z=1; apply(); }
   apply();
