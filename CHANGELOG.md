@@ -2,6 +2,11 @@
 
 All notable changes to spotlight-md follow [Semantic Versioning](https://semver.org/).
 
+## 0.6.1 — 2026-08-17
+
+- Merged the two development lines into one build: the persistent multi-document daemon (virtual routes, `status`/`stop`, recent-documents sidebar, first-run guide) now serves the full review toolkit (suggested edits, whole-document composer, AI-working pulses, zoom, LaTeX section numbering, `currentToc`). Each registered document gets its own review session, live-reload channel, and highlight/suggestion state.
+- The daemon watches the highlight database, so CLI-driven changes appear live in every open document; file changes patch the page in place (no full reload).
+
 ## 0.5.0 — 2026-08-17
 
 - Added LaTeX-style section numbering (display only) to headings and the table of contents: each `##` is section N, each `###` is N.M, so passages are easy to refer to (e.g. "section 2.1").
@@ -30,9 +35,15 @@ All notable changes to spotlight-md follow [Semantic Versioning](https://semver.
 - The server now watches the highlight database, so annotations made out-of-process (an AI agent running the CLI) appear in the browser instantly without needing a document edit.
 - Added `list-suggestions` for inspecting pending/resolved suggestions.
 
+## 0.2.0-daemon — 2026-08-11 (parallel line, merged in 0.6.1)
+
+- Replaced per-document foreground servers with one reusable local daemon on port 7231.
+- Added registered-only, safely encoded virtual document routes with isolated live reload and highlight APIs.
+- Added `status` and `stop` lifecycle commands.
+- Stopped writing neighboring HTML files in auto mode; `-o` remains available for static exports.
+
 ## 0.1.1 — 2026-08-10
 
 - Added global SQLite-backed review sessions, agent read cursors, waitable updates, and close-session audit summaries.
 - Added `spotlight-md prime` guidance for collaborative human/AI document review.
 - Fixed Enter submission for a highlight's optional note.
-

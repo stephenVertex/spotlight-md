@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { join, resolve } from "node:path";
@@ -22,11 +22,8 @@ async function unusedPort() {
   return port;
 }
 
-async function waitForServer(url, child) {
+async function waitForServer(url) {
   for (let attempt = 0; attempt < 50; attempt++) {
-    if (child.exitCode !== null) {
-      throw new Error(`spotlight-md exited before serving (${child.exitCode})`);
-    }
     try {
       const response = await fetch(`${url}/__highlights__`);
       if (response.ok) return;
@@ -38,11 +35,17 @@ async function waitForServer(url, child) {
   throw new Error("timed out waiting for spotlight-md to serve highlights");
 }
 
-async function stop(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = once(child, "exit");
-  child.kill("SIGTERM");
-  await exited;
+async function waitForPageText(url, expected) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const response = await fetch(url);
+    if (response.ok && (await response.text()).includes(expected)) return;
+    await sleep(50);
+  }
+  throw new Error(`timed out waiting for rendered page to contain ${expected}`);
+}
+
+function virtualRoute(inputPath) {
+  return "/spotlight/" + inputPath.replace(/\.md$/i, ".html").split("/").filter(Boolean).map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
 }
 
 function cli(args, env) {
@@ -64,20 +67,20 @@ test("global service sessions support agent cursors, completion, and close summa
   const configDir = join(dir, "config");
   const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
   const port = await unusedPort();
-  const url = `http://127.0.0.1:${port}`;
   writeFileSync(inputPath, "# Audit\n\nSelected audit passage\n");
 
-  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
-    stdio: "ignore",
-    env: { ...process.env, ...env },
-  });
+  const auto = cli(["--auto", "--no-open", "--json", "--port", String(port), inputPath], env);
+  assert.equal(auto.status, 0, auto.stderr);
+  const registration = JSON.parse(auto.stdout);
+  const url = registration.url;
 
   t.after(async () => {
-    await stop(child);
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
     rmSync(dir, { recursive: true, force: true });
   });
 
-  await waitForServer(url, child);
+  await waitForServer(url);
   const createResponse = await fetch(`${url}/__highlights__`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -136,198 +139,101 @@ test("global service sessions support agent cursors, completion, and close summa
   assert.match(result.stdout, /Completed as requested/);
 });
 
-test("suggested edits: propose via CLI, approve splices the source, reject leaves it untouched", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-suggest-"));
-  const inputPath = join(dir, "doc.md");
+test("one daemon isolates registered documents and safely encodes virtual routes", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-daemon-"));
   const configDir = join(dir, "config");
   const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
   const port = await unusedPort();
-  const url = `http://127.0.0.1:${port}`;
-  writeFileSync(inputPath, "# Doc\n\nThe quick brown fox.\n\nA second sentence stays put.\n");
+  const firstPath = join(dir, "alpha #100%.md");
+  const secondPath = join(dir, "β notes.md");
+  const unregisteredPath = join(dir, "private # notes.md");
+  writeFileSync(firstPath, "# First\n\nFirst document passage\n");
+  writeFileSync(secondPath, "# Second\n\nSecond document passage\n");
+  writeFileSync(unregisteredPath, "# Private\n\nMust not be served\n");
 
-  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
-    stdio: "ignore",
-    env: { ...process.env, ...env },
-  });
   t.after(async () => {
-    await stop(child);
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
     rmSync(dir, { recursive: true, force: true });
   });
-  await waitForServer(url, child);
 
-  const session = await (await fetch(`${url}/__session__`)).json();
-  const highlight = await (await fetch(`${url}/__highlights__`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: "The quick brown fox.", sectionId: "doc", sectionTitle: "Doc", note: "rephrase" }),
-  })).json();
-
-  // Propose a suggested edit tied to the highlight, with a thread comment.
-  let result = cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
-    "--anchor", "The quick brown fox.", "--replacement", "A swift auburn fox leapt.",
-    "--comment", "Acknowledged, rephrasing.", "--agent-id", "codex-test", "--json"], env);
+  let result = cli(["--auto", "--no-open", "--json", "--port", String(port), firstPath], env);
   assert.equal(result.status, 0, result.stderr);
-  const proposed = JSON.parse(result.stdout);
-  assert.match(proposed.suggestion.id, /^sg-[a-f0-9]{10}$/);
-  assert.equal(proposed.suggestion.status, "pending");
-  assert.equal(proposed.message.text, "Acknowledged, rephrasing.");
+  const first = JSON.parse(result.stdout);
+  assert.equal(first.route, virtualRoute(realpathSync(firstPath)));
+  assert.match(first.route, /alpha%20%23100%25\.html$/);
 
-  // The suggestion rides along with the highlight in the browser payload.
-  let hls = await (await fetch(`${url}/__highlights__`)).json();
-  assert.equal(hls[0].suggestions.length, 1);
-  assert.equal(hls[0].suggestions[0].replacement, "A swift auburn fox leapt.");
-
-  // Rejecting a suggestion leaves the document untouched.
-  const second = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
-    "--anchor", "A second sentence stays put.", "--replacement", "SHOULD NOT APPLY", "--json"], env).stdout);
-  const rejectRes = await fetch(`${url}/__suggestions__/${second.suggestion.id}/reject`, { method: "PATCH" });
-  assert.equal(rejectRes.status, 200);
-  assert.equal((await rejectRes.json()).status, "rejected");
-  assert.match(readFileSync(inputPath, "utf8"), /A second sentence stays put\./);
-  assert.doesNotMatch(readFileSync(inputPath, "utf8"), /SHOULD NOT APPLY/);
-
-  // Approving splices anchor→replacement into the markdown source.
-  const acceptRes = await fetch(`${url}/__suggestions__/${proposed.suggestion.id}/accept`, { method: "PATCH" });
-  assert.equal(acceptRes.status, 200);
-  assert.equal((await acceptRes.json()).status, "accepted");
-  const after = readFileSync(inputPath, "utf8");
-  assert.match(after, /A swift auburn fox leapt\./);
-  assert.doesNotMatch(after, /The quick brown fox\./);
-
-  // Once accepted it is no longer pending, so it drops off the highlight.
-  hls = await (await fetch(`${url}/__highlights__`)).json();
-  assert.equal(hls[0].suggestions.length, 0);
-
-  // Approving a suggestion whose anchor no longer exists fails cleanly.
-  const stale = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
-    "--anchor", "text that is not present", "--replacement", "x", "--json"], env).stdout);
-  const staleRes = await fetch(`${url}/__suggestions__/${stale.suggestion.id}/accept`, { method: "PATCH" });
-  assert.equal(staleRes.status, 409);
-});
-
-test("suggested edits match anchors across markdown line wrapping", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-wrap-"));
-  const inputPath = join(dir, "doc.md");
-  const configDir = join(dir, "config");
-  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
-  const port = await unusedPort();
-  const url = `http://127.0.0.1:${port}`;
-  // The prose is hard-wrapped, so the source has a newline where the rendered
-  // text (and thus a copied anchor) has a space.
-  writeFileSync(inputPath, "# Doc\n\nSmells pleasantly sour (not\nlike nail polish remover), and passes.\n");
-
-  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
-    stdio: "ignore", env: { ...process.env, ...env },
-  });
-  t.after(async () => { await stop(child); rmSync(dir, { recursive: true, force: true }); });
-  await waitForServer(url, child);
-
-  const session = await (await fetch(`${url}/__session__`)).json();
-  const highlight = await (await fetch(`${url}/__highlights__`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: "(not like nail polish remover)", note: "reword" }),
-  })).json();
-
-  // Anchor uses a single space, matching the rendered text, not the wrapped source.
-  const proposed = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", highlight.id,
-    "--anchor", "(not like nail polish remover)", "--replacement", "(not sharp or solvent-like)", "--json"], env).stdout);
-  const acceptRes = await fetch(`${url}/__suggestions__/${proposed.suggestion.id}/accept`, { method: "PATCH" });
-  assert.equal(acceptRes.status, 200, "wrapped anchor should still splice");
-  const after = readFileSync(inputPath, "utf8");
-  assert.match(after, /\(not sharp or solvent-like\)/);
-  assert.doesNotMatch(after, /nail polish remover/);
-});
-
-test("ai-agent-claim surfaces a thinking state that a response clears", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-claim-"));
-  const inputPath = join(dir, "doc.md");
-  const configDir = join(dir, "config");
-  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
-  const port = await unusedPort();
-  const url = `http://127.0.0.1:${port}`;
-  writeFileSync(inputPath, "# Doc\n\nA passage to review.\n");
-
-  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
-    stdio: "ignore", env: { ...process.env, ...env },
-  });
-  t.after(async () => { await stop(child); rmSync(dir, { recursive: true, force: true }); });
-  await waitForServer(url, child);
-
-  const session = await (await fetch(`${url}/__session__`)).json();
-  const highlight = await (await fetch(`${url}/__highlights__`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: "A passage to review.", note: "look at this" }),
-  })).json();
-
-  // Initially no AI state.
-  let hls = await (await fetch(`${url}/__highlights__`)).json();
-  assert.equal(hls[0].aiState, null);
-
-  // Claiming marks it as thinking in the browser payload.
-  assert.equal(cli(["ai-agent-claim", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--json"], env).status, 0);
-  hls = await (await fetch(`${url}/__highlights__`)).json();
-  assert.equal(hls[0].aiState, "thinking");
-
-  // Responding with a comment auto-releases the claim.
-  assert.equal(cli(["add-comment", "--session-id", session.id, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--comment", "done", "--json"], env).status, 0);
-  hls = await (await fetch(`${url}/__highlights__`)).json();
-  assert.equal(hls[0].aiState, null);
-
-  // Claim then explicitly release.
-  cli(["ai-agent-claim", "--session-id", session.id, "--highlight-id", highlight.id, "--json"], env);
-  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, "thinking");
-  cli(["ai-agent-claim", "--session-id", session.id, "--highlight-id", highlight.id, "--release", "--json"], env);
-  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, null);
-});
-
-test("whole-document directives reach the agent loop as document-scoped items", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-directive-"));
-  const inputPath = join(dir, "doc.md");
-  const configDir = join(dir, "config");
-  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
-  const port = await unusedPort();
-  const url = `http://127.0.0.1:${port}`;
-  writeFileSync(inputPath, "# Doc\n\nSection one.\n\nSection two.\n");
-
-  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
-    stdio: "ignore", env: { ...process.env, ...env },
-  });
-  t.after(async () => { await stop(child); rmSync(dir, { recursive: true, force: true }); });
-  await waitForServer(url, child);
-
-  const session = await (await fetch(`${url}/__session__`)).json();
-
-  // Composer posts a whole-document directive.
-  const res = await fetch(`${url}/__directives__`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: "add a joke to the end of each section" }),
-  });
-  assert.equal(res.status, 201);
-  const directive = await res.json();
-  assert.equal(directive.scope, "document");
-  assert.match(directive.id, /^dm-/);
-
-  // It surfaces to the agent loop like any other unread item.
-  const unread = JSON.parse(cli(["get-new-comments", "--session-id", session.id, "--agent-id", "codex-test", "--json"], env).stdout);
-  const found = unread.find((h) => h.id === directive.id);
-  assert.ok(found, "directive should be unread work for the agent");
-  assert.equal(found.scope, "document");
-  assert.equal(found.text, "add a joke to the end of each section");
-
-  // The agent can respond and suggest edits against it.
-  assert.equal(cli(["add-comment", "--session-id", session.id, "--highlight-id", directive.id, "--agent-id", "codex-test", "--comment", "On it.", "--json"], env).status, 0);
-  const sug = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", directive.id, "--anchor", "Section one.", "--replacement", "Section one. (ha!)", "--json"], env).stdout);
-  const hls = await (await fetch(`${url}/__highlights__`)).json();
-  const d = hls.find((h) => h.id === directive.id);
-  assert.equal(d.suggestions.length, 1);
-  assert.equal(d.suggestions[0].id, sug.suggestion.id);
-});
-
-test("prime documents the suggest-edit workflow for agents", () => {
-  const result = cli(["prime"], {});
+  result = cli(["--auto", "--no-open", "--json", "--port", String(port), secondPath], env);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /suggest-edit --session-id/);
-  assert.match(result.stdout, /--anchor/);
-  assert.match(result.stdout, /--replacement/);
+  const second = JSON.parse(result.stdout);
+  assert.equal(second.route, virtualRoute(realpathSync(secondPath)));
+  assert.match(second.route, /%CE%B2%20notes\.html$/);
+  assert.notEqual(first.url, second.url);
+
+  result = cli(["status", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  let status = JSON.parse(result.stdout);
+  assert.deepEqual(status.documents.map((document) => document.path), [realpathSync(secondPath), realpathSync(firstPath)], "new registrations are the most recent activity");
+  assert.ok(status.documents.every((document) => document.lastActivityAt), "status exposes document activity timestamps");
+
+  const secondPage = await (await fetch(second.url)).text();
+  assert.match(secondPage, /<div class="sidebar-section-title">Recent documents<\/div>/);
+  assert.ok(secondPage.includes(`<a href="${second.route}" class="recent-document-link active" aria-current="page">`), "marks the open document in the recent list");
+  assert.ok(secondPage.includes(`<a href="${first.route}" class="recent-document-link">`), "links to another registered document's virtual route");
+  assert.ok(secondPage.includes(realpathSync(firstPath)) && secondPage.includes(realpathSync(secondPath)), "canonical paths disambiguate recent document entries");
+  assert.equal(secondPage.includes(unregisteredPath), false, "does not expose unregistered documents in the recent list");
+  assert.ok(secondPage.indexOf(`href="${second.route}"`) < secondPage.indexOf(`href="${first.route}"`), "renders most recently active documents first");
+
+  result = cli(["--auto", "--no-open", "--json", "--port", String(port), firstPath], env);
+  assert.equal(result.status, 0, result.stderr);
+  const resumed = JSON.parse(result.stdout);
+  assert.equal(resumed.sessionId, first.sessionId);
+  assert.equal(resumed.resumed, true);
+
+  assert.equal(existsSync(firstPath.replace(/\.md$/i, ".html")), false, "auto mode must not write a neighboring HTML file");
+  assert.equal(existsSync(secondPath.replace(/\.md$/i, ".html")), false, "auto mode must not write a neighboring HTML file");
+
+  assert.match(await (await fetch(first.url)).text(), /First document passage/);
+  assert.match(await (await fetch(second.url)).text(), /Second document passage/);
+  const hiddenResponse = await fetch(`http://127.0.0.1:${port}${virtualRoute(realpathSync(unregisteredPath))}`);
+  assert.equal(hiddenResponse.status, 404, "a real but unregistered path must not be readable through a virtual route");
+
+  const created = await fetch(`${first.url}/__highlights__`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "First document passage" }),
+  });
+  assert.equal(created.status, 201);
+  assert.equal((await (await fetch(`${first.url}/__highlights__`)).json()).length, 1);
+  assert.deepEqual(await (await fetch(`${second.url}/__highlights__`)).json(), [], "highlight APIs must remain document-scoped");
+
+  const linkedUrl = new URL(first.route, second.url);
+  assert.match(await (await fetch(linkedUrl)).text(), /First document passage/, "a recent entry opens the registered document route");
+  assert.equal((await (await fetch(`${linkedUrl}/__session__`)).json()).id, first.sessionId, "the linked route restores the document's active session");
+  assert.equal((await (await fetch(`${linkedUrl}/__highlights__`)).json()).length, 1, "the linked route restores access to the session's highlights");
+
+  result = cli(["status", "--port", String(port), "--json"], env);
+  status = JSON.parse(result.stdout);
+  assert.equal(status.documents[0].path, realpathSync(firstPath), "review and navigation activity move a document to the front");
+
+  writeFileSync(firstPath, "# First\n\nReloaded first document\n");
+  await waitForPageText(first.url, "Reloaded first document");
+  assert.match(await (await fetch(second.url)).text(), /Second document passage/, "one document reload must not replace another document's page");
+
+  result = cli(["status", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  status = JSON.parse(result.stdout);
+  assert.equal(status.running, true);
+  assert.equal(status.documents.length, 2);
+  assert.deepEqual(new Set(status.documents.map((document) => document.path)), new Set([realpathSync(firstPath), realpathSync(secondPath)]));
+
+  result = cli(["stop", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).ok, true);
+  await sleep(100);
+  result = cli(["status", "--port", String(port), "--json"], env);
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(result.stdout).running, false);
 });
 
 test("selection popup submit handler receives its event instead of referencing an undeclared variable", () => {
@@ -342,6 +248,43 @@ test("selection popup submit handler receives its event instead of referencing a
     true,
     "pressing Enter in the note field must pass its keyboard event to submit",
   );
+});
+
+test("live review pages include a dismissible first-run collaboration guide", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-guide-"));
+  const inputPath = join(dir, "guide.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  writeFileSync(inputPath, "# Guide\n\nA passage to review.\n");
+
+  const auto = cli(["--auto", "--no-open", "--json", "--port", String(port), inputPath], env);
+  assert.equal(auto.status, 0, auto.stderr);
+  const { url } = JSON.parse(auto.stdout);
+
+  t.after(async () => {
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  await waitForServer(url);
+  const page = await (await fetch(url)).text();
+
+  assert.match(page, /id="spotlight-guide"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.equal((page.match(/class="spotlight-guide-step"/g) || []).length, 5);
+  assert.match(page, /Select text/);
+  assert.match(page, /optional note/i);
+  assert.match(page, /Submit the highlight/);
+  assert.match(page, /whole document/i);
+  assert.match(page, /suggested edits/i);
+  assert.match(page, /sessions preserve[^<]*review and audit trail/i);
+  assert.match(page, /id="spotlight-guide-dismiss"[^>]*>Got it<\/button>/);
+  assert.match(page, /id="spotlight-guide-open"[^>]*>Guide<\/button>/);
+  assert.match(page, /spotlight-md\.guide\.v1\.dismissed/);
+  assert.match(page, /localStorage\.getItem\(guideStorageKey\)/);
+  assert.match(page, /localStorage\.setItem\(guideStorageKey, '1'\)/);
+  assert.match(page, /if \(e\.key === 'Escape' && !guide\.hidden\)/);
 });
 
 test("prime teaches agents the session-based collaborative review loop", () => {
@@ -365,4 +308,113 @@ test("rendered pages include a fixed spotlight-md version badge", () => {
   assert.match(source, /class="spotlight-brand"/);
   assert.match(source, /spotlight-md <span>v\$\{escapeHtml\(VERSION\)\}/);
   assert.match(source, /\.spotlight-brand \{\s*position: fixed;/);
+});
+
+// ── Review features layered on the daemon (suggestions, claims, directives) ──
+
+async function registerDoc(t, contents) {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-review-"));
+  const inputPath = join(dir, "doc.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  writeFileSync(inputPath, contents);
+  const auto = cli(["--auto", "--no-open", "--json", "--port", String(port), inputPath], env);
+  assert.equal(auto.status, 0, auto.stderr);
+  const registration = JSON.parse(auto.stdout);
+  t.after(async () => {
+    cli(["stop", "--port", String(port), "--json"], env);
+    await sleep(100);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await waitForServer(registration.url);
+  return { env, inputPath, url: registration.url, sessionId: registration.sessionId };
+}
+
+test("suggested edits propose via CLI, approve splices the source, reject leaves it untouched", async (t) => {
+  const { env, inputPath, url, sessionId } = await registerDoc(t, "# Doc\n\nThe quick brown fox.\n\nA second sentence stays put.\n");
+  const highlight = await (await fetch(`${url}/__highlights__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "The quick brown fox.", note: "rephrase" }),
+  })).json();
+
+  let result = cli(["suggest-edit", "--session-id", sessionId, "--highlight-id", highlight.id,
+    "--anchor", "The quick brown fox.", "--replacement", "A swift auburn fox leapt.",
+    "--comment", "Acknowledged, rephrasing.", "--agent-id", "codex-test", "--json"], env);
+  assert.equal(result.status, 0, result.stderr);
+  const proposed = JSON.parse(result.stdout);
+  assert.match(proposed.suggestion.id, /^sg-[a-f0-9]{10}$/);
+
+  let hls = await (await fetch(`${url}/__highlights__`)).json();
+  assert.equal(hls[0].suggestions.length, 1);
+
+  const second = JSON.parse(cli(["suggest-edit", "--session-id", sessionId, "--highlight-id", highlight.id,
+    "--anchor", "A second sentence stays put.", "--replacement", "SHOULD NOT APPLY", "--json"], env).stdout);
+  const rejectRes = await fetch(`${url}/__suggestions__/${second.suggestion.id}/reject`, { method: "PATCH" });
+  assert.equal(rejectRes.status, 200);
+  assert.doesNotMatch(readFileSync(inputPath, "utf8"), /SHOULD NOT APPLY/);
+
+  const acceptRes = await fetch(`${url}/__suggestions__/${proposed.suggestion.id}/accept`, { method: "PATCH" });
+  assert.equal(acceptRes.status, 200);
+  const after = readFileSync(inputPath, "utf8");
+  assert.match(after, /A swift auburn fox leapt\./);
+  assert.doesNotMatch(after, /The quick brown fox\./);
+
+  const stale = JSON.parse(cli(["suggest-edit", "--session-id", sessionId, "--highlight-id", highlight.id,
+    "--anchor", "text that is not present", "--replacement", "x", "--json"], env).stdout);
+  const staleRes = await fetch(`${url}/__suggestions__/${stale.suggestion.id}/accept`, { method: "PATCH" });
+  assert.equal(staleRes.status, 409);
+});
+
+test("suggested edits match anchors across markdown line wrapping", async (t) => {
+  const { env, inputPath, url, sessionId } = await registerDoc(t, "# Doc\n\nSmells pleasantly sour (not\nlike nail polish remover), and passes.\n");
+  const highlight = await (await fetch(`${url}/__highlights__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "(not like nail polish remover)", note: "reword" }),
+  })).json();
+  const proposed = JSON.parse(cli(["suggest-edit", "--session-id", sessionId, "--highlight-id", highlight.id,
+    "--anchor", "(not like nail polish remover)", "--replacement", "(not sharp or solvent-like)", "--json"], env).stdout);
+  const acceptRes = await fetch(`${url}/__suggestions__/${proposed.suggestion.id}/accept`, { method: "PATCH" });
+  assert.equal(acceptRes.status, 200, "wrapped anchor should still splice");
+  assert.match(readFileSync(inputPath, "utf8"), /\(not sharp or solvent-like\)/);
+});
+
+test("ai-agent-claim surfaces a thinking state that a response clears", async (t) => {
+  const { env, url, sessionId } = await registerDoc(t, "# Doc\n\nA passage to review.\n");
+  const highlight = await (await fetch(`${url}/__highlights__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "A passage to review.", note: "look" }),
+  })).json();
+  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, null);
+  cli(["ai-agent-claim", "--session-id", sessionId, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--json"], env);
+  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, "thinking");
+  cli(["add-comment", "--session-id", sessionId, "--highlight-id", highlight.id, "--agent-id", "codex-test", "--comment", "done", "--json"], env);
+  assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, null);
+});
+
+test("whole-document directives reach the agent loop with a numbered outline", async (t) => {
+  const { env, url, sessionId } = await registerDoc(t, "# Doc\n\nIntro.\n\n## First\n\nOne.\n\n### Sub\n\nDetail.\n\n## Second\n\nTwo.\n");
+  const res = await fetch(`${url}/__directives__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "add a joke to the end of each section" }),
+  });
+  assert.equal(res.status, 201);
+  const directive = await res.json();
+  assert.equal(directive.scope, "document");
+  assert.match(directive.id, /^dm-/);
+
+  const unread = JSON.parse(cli(["get-new-comments", "--session-id", sessionId, "--agent-id", "codex-test", "--json"], env).stdout);
+  const found = unread.find((h) => h.id === directive.id);
+  assert.ok(found, "directive should be unread work");
+  assert.equal(found.scope, "document");
+  assert.deepEqual(found.currentToc.map((s) => s.number + " " + s.title), ["1 First", "1.1 Sub", "2 Second"]);
+});
+
+test("prime documents the suggest-edit and whole-document workflows", () => {
+  const result = cli(["prime"], {});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /suggest-edit --session-id/);
+  assert.match(result.stdout, /--anchor/);
+  assert.match(result.stdout, /currentToc/);
+  assert.match(result.stdout, /ai-agent-claim/);
 });

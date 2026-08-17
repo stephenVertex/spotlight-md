@@ -6,7 +6,7 @@
 //   mdhtml --port 4040 --auto file.md
 // Zero dependencies. Node 18+.
 
-import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, watchFile, unwatchFile, statSync, mkdirSync, realpathSync, unlinkSync, chmodSync } from "node:fs";
 import { resolve, dirname, basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 import { createServer } from "node:http";
@@ -18,12 +18,13 @@ const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, release: false, json: false, newSession: false };
+  const opts = { auto: false, daemon: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, release: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
-    else if (["list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-claim", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
+    else if (["status", "stop", "list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-claim", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
+    else if (a === "--daemon") opts.daemon = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
     else if (a === "--output" || a === "-o") opts.output = argv[++i];
     else if (a === "--no-open") opts.open = false;
@@ -53,6 +54,8 @@ function parseArgs(argv) {
 
 Usage:
   spotlight-md --auto [--json] [--new-session] FILE.md
+  spotlight-md status [--port NUM] [--json]
+  spotlight-md stop [--port NUM] [--json]
   spotlight-md list-highlights --session-id ID [--json]
   spotlight-md get-highlight-details --session-id ID --highlight-id ID [--json]
   spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--json]
@@ -1467,9 +1470,248 @@ mark.mdhtml-hl.has-suggestion::after {
   .sidebar { display: none; }
   .content { padding: 32px 20px 80px; }
 }
+/* ── Daemon: recent documents + first-run guide ── */
+.sidebar-section-title {
+  padding: 0 20px 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.recent-documents {
+  padding: 0 8px 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.recent-document-link {
+  display: block;
+  padding: 7px 10px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+  border-radius: 6px;
+  line-height: 1.35;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.recent-document-link:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.04);
+  text-decoration: none;
+}
+.recent-document-link.active {
+  color: var(--heading);
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+}
+.recent-document-title {
+  display: block;
+  overflow: hidden;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-document-path {
+  display: block;
+  overflow: hidden;
+  margin-top: 1px;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-document-link.active .recent-document-path { color: var(--text); }
+
+.hl-panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.spotlight-guide-open {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.spotlight-guide-open:hover,
+.spotlight-guide-open:focus-visible {
+
+.spotlight-guide {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(1, 4, 9, 0.76);
+  backdrop-filter: blur(3px);
+}
+.spotlight-guide[hidden] { display: none; }
+.spotlight-guide-card {
+  position: relative;
+  width: min(620px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  padding: 30px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg-secondary);
+  box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+}
+.spotlight-guide-kicker {
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.spotlight-guide-card h2 {
+  margin: 0 36px 6px 0;
+  padding: 0;
+  border: 0;
+  font-size: 24px;
+}
+.spotlight-guide-intro {
+  margin-bottom: 20px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+.spotlight-guide-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.spotlight-guide-close:hover,
+.spotlight-guide-close:focus-visible {
+  border-color: var(--border);
+  color: var(--heading);
+  outline: none;
+}
+.spotlight-guide-steps {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 0 0 18px;
+  padding: 0;
+  list-style: none;
+  counter-reset: guide-step;
+}
+.spotlight-guide-step {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 9px;
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  counter-increment: guide-step;
+}
+.spotlight-guide-step::before {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  content: counter(guide-step);
+  font-size: 12px;
+  font-weight: 700;
+}
+.spotlight-guide-step strong {
+  display: block;
+  margin-bottom: 1px;
+  font-size: 13px;
+}
+.spotlight-guide-step span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.spotlight-guide-audit {
+  margin-bottom: 18px;
+  padding: 11px 13px;
+  border-left: 3px solid var(--link);
+  border-radius: 0 6px 6px 0;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.spotlight-guide-dismiss {
+  display: block;
+  margin-left: auto;
+  padding: 7px 18px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.spotlight-guide-dismiss:hover,
+.spotlight-guide-dismiss:focus-visible {
+  filter: brightness(1.08);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+body.spotlight-guide-opened { overflow: hidden; }
+/* Mobile */
+@media (max-width: 1100px) {
+  .hl-panel { display: none; }
+}
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .content { padding: 32px 20px 80px; }
+}
+@media (max-width: 600px) {
+  .spotlight-guide { padding: 12px; }
+  .spotlight-guide-card { max-height: calc(100vh - 24px); padding: 24px 18px 18px; }
+  .spotlight-guide-steps { grid-template-columns: 1fr; }
+
 `;
 
-function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName) {
+function buildRecentDocumentsHtml(recentDocuments, currentRoute) {
+  if (!recentDocuments.length) return "";
+  let html = '    <div class="sidebar-section-title">Recent documents</div>\n    <div class="recent-documents">\n';
+  for (const document of recentDocuments) {
+    const active = document.route === currentRoute;
+    html += `      <a href="${escapeHtml(document.route)}" class="recent-document-link${active ? " active" : ""}"${active ? ' aria-current="page"' : ""}>\n`;
+    html += `        <span class="recent-document-title">${escapeHtml(basename(document.path))}</span>\n`;
+    html += `        <span class="recent-document-path">${escapeHtml(document.path)}</span>\n`;
+    html += "      </a>\n";
+  }
+  return html + "    </div>\n";
+}
+
+function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeName, documentRoute = "", recentDocuments = []) {
+  // The daemon serves each document under a virtual route; the client prefixes
+  // every API/SSE call with this base. It is "" for a static/root render.
+  const apiBase = JSON.stringify(documentRoute);
   const reloadScript = autoMode
     ? `<div id="reload-badge">Updated</div>
 <script>
@@ -1540,6 +1782,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   const highlightScript = autoMode ? `
 <script>
 (function(){
+  var apiBase = ${apiBase};
   var content = document.querySelector('.content');
   if (!content) return;
   var selPopup = null;
@@ -1811,7 +2054,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         resolveEl.addEventListener('click', function(e){
           e.stopPropagation();
           var action = resolveEl.dataset.action;
-          fetch('/__highlights__/' + id + '/' + action, { method: 'PATCH' })
+          fetch(apiBase + '/__highlights__/' + id + '/' + action, { method: 'PATCH' })
             .then(function(r){return r.json()})
             .then(function(){ loadAndApply(); })
             .catch(function(){});
@@ -1844,7 +2087,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   // failures (e.g. the anchor no longer matches the source) instead of failing
   // silently, so the reviewer knows the click did not take effect.
   function resolveSuggestion(sid, action) {
-    fetch('/__suggestions__/' + sid + '/' + action, { method: 'PATCH' })
+    fetch(apiBase + '/__suggestions__/' + sid + '/' + action, { method: 'PATCH' })
       .then(function(r){
         if (!r.ok) return r.json().catch(function(){ return {}; }).then(function(e){ throw new Error(e.error || ('HTTP ' + r.status)); });
         return r.json();
@@ -1961,7 +2204,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       e.stopPropagation();
       var text = editor.value.trim();
       if (!text) { cleanup(); return; }
-      fetch('/__highlights__/' + id + '/messages', {
+      fetch(apiBase + '/__highlights__/' + id + '/messages', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ author: 'human', text: text })
@@ -1986,7 +2229,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   function loadAndApply() {
     if (loadInFlight) { loadQueued = true; return; }
     loadInFlight = true;
-    fetch('/__highlights__').then(function(r){return r.json()}).then(function(hls){
+    fetch(apiBase + '/__highlights__').then(function(r){return r.json()}).then(function(hls){
       clearInlineSuggestions();
       clearHighlights();
       hls.forEach(applyHighlight);
@@ -2037,7 +2280,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   // DOM without a full navigation, so scroll position, zoom, and text
   // selection all survive. Highlights and suggestions are re-applied after.
   function patchContent() {
-    fetch('/__content__').then(function(r){return r.json()}).then(function(data){
+    fetch(apiBase + '/__content__').then(function(r){return r.json()}).then(function(data){
       var scrollY = window.scrollY;
       if (data.title) {
         document.title = data.title;
@@ -2171,7 +2414,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       sectionTitle: selection.sectionTitle,
       note: note || undefined
     });
-    fetch('/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
+    fetch(apiBase + '/__highlights__', {method:'POST', headers:{'Content-Type':'application/json'}, body:body})
       .then(function(r){
         if (!r.ok) throw new Error('could not create highlight');
         return r.json();
@@ -2213,7 +2456,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   }
 
   function completeHighlight(id) {
-    fetch('/__highlights__/' + id, {method:'DELETE'})
+    fetch(apiBase + '/__highlights__/' + id, {method:'DELETE'})
       .then(function(r){return r.json()})
       .then(function(){
         loadAndApply();
@@ -2223,7 +2466,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   // -- Events --
   document.addEventListener('mouseup', function(e){
-    if (e.target.closest('.hl-popup, .hl-delete-popup, .sidebar')) return;
+    if (e.target.closest('.hl-popup, .hl-delete-popup, .sidebar, .spotlight-guide')) return;
     setTimeout(function(){
       var selection = selectedHighlightData();
       removeSelPopup();
@@ -2255,7 +2498,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   //    highlights-updated → re-fetch annotations (covers CLI-driven changes
   //    like an AI agent adding comments or suggestions). --
   try {
-    var es = new EventSource('/__reload__');
+    var es = new EventSource(apiBase + '/__reload__');
     es.addEventListener('content-updated', function(){ patchContent(); });
     es.addEventListener('highlights-updated', function(){ loadAndApply(); });
     // Back-compat: an older server may still emit a plain reload event.
@@ -2280,6 +2523,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 </div>
 <script>
 (function(){
+  var apiBase = ${apiBase};
   var input = document.getElementById('doc-composer-input');
   var sendBtn = document.getElementById('doc-composer-send');
   var status = document.getElementById('doc-composer-status');
@@ -2289,7 +2533,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     if (text.length < 2) { input.focus(); return; }
     sendBtn.disabled = true;
     status.textContent = 'Sending\\u2026';
-    fetch('/__directives__', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text})})
+    fetch(apiBase + '/__directives__', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text})})
       .then(function(r){ if (!r.ok) throw new Error(); return r.json(); })
       .then(function(){
         input.value = '';
@@ -2307,12 +2551,62 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 })();
 </script>` : "";
 
-  const sidebarHtml = tocHtml ? `  <nav class="sidebar">
-    <div class="sidebar-header"><div class="doc-title">${escapeHtml(title)}</div></div>
-    <div class="toc">
+  const recentDocumentsHtml = buildRecentDocumentsHtml(recentDocuments, documentRoute);
+  const tocSectionHtml = tocHtml ? `${recentDocumentsHtml ? '    <div class="sidebar-section-title">On this page</div>\n' : ""}    <div class="toc">
 ${tocHtml}
     </div>
+` : "";
+  const sidebarHtml = tocHtml || recentDocumentsHtml ? `  <nav class="sidebar">
+    <div class="sidebar-header"><div class="doc-title">${escapeHtml(title)}</div></div>
+${recentDocumentsHtml}${tocSectionHtml}
   </nav>` : "";
+
+  // First-run quick-start guide (dismissible, remembered in localStorage).
+  const guideButtonHtml = autoMode ? '<button class="spotlight-guide-open" id="spotlight-guide-open" type="button">Guide</button>' : "";
+  const guideHtml = autoMode ? `
+<div class="spotlight-guide" id="spotlight-guide" role="dialog" aria-modal="true" aria-labelledby="spotlight-guide-title" aria-describedby="spotlight-guide-intro" hidden>
+  <section class="spotlight-guide-card">
+    <button class="spotlight-guide-close" id="spotlight-guide-close" type="button" aria-label="Dismiss guide">&times;</button>
+    <div class="spotlight-guide-kicker">Quick start</div>
+    <h2 id="spotlight-guide-title">Review with spotlight-md</h2>
+    <p class="spotlight-guide-intro" id="spotlight-guide-intro">Turn document feedback into a focused conversation.</p>
+    <ol class="spotlight-guide-steps">
+      <li class="spotlight-guide-step"><div><strong>Select text</strong><span>Drag over a passage in the document.</span></div></li>
+      <li class="spotlight-guide-step"><div><strong>Add an optional note</strong><span>Give the reviewer or agent context in the popup.</span></div></li>
+      <li class="spotlight-guide-step"><div><strong>Submit the highlight</strong><span>Choose &#10022; Highlight, or press Enter in the note field.</span></div></li>
+      <li class="spotlight-guide-step"><div><strong>Message the whole document</strong><span>Use the bottom-left composer to ask the AI for document-wide changes.</span></div></li>
+      <li class="spotlight-guide-step"><div><strong>Approve suggested edits</strong><span>Hover a proposed change and Approve or Dismiss it inline.</span></div></li>
+    </ol>
+    <p class="spotlight-guide-audit">Sessions preserve the complete review and audit trail&mdash;highlights, replies, resolutions, and the starting document stay together as the work changes.</p>
+    <button class="spotlight-guide-dismiss" id="spotlight-guide-dismiss" type="button">Got it</button>
+  </section>
+</div>` : "";
+  const guideScript = autoMode ? `
+<script>
+(function(){
+  var guide = document.getElementById('spotlight-guide');
+  var openButton = document.getElementById('spotlight-guide-open');
+  var closeButton = document.getElementById('spotlight-guide-close');
+  var dismissButton = document.getElementById('spotlight-guide-dismiss');
+  var guideStorageKey = 'spotlight-md.guide.v1.dismissed';
+  var lastFocused = null;
+  if (!guide || !openButton || !closeButton || !dismissButton) return;
+  function wasDismissed(){ try { return localStorage.getItem(guideStorageKey) === '1'; } catch (e) { return false; } }
+  function openGuide(){ lastFocused = document.activeElement; guide.hidden = false; document.body.classList.add('spotlight-guide-opened'); dismissButton.focus(); }
+  function dismissGuide(){ guide.hidden = true; document.body.classList.remove('spotlight-guide-opened'); try { localStorage.setItem(guideStorageKey, '1'); } catch (e) {} if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus(); }
+  openButton.addEventListener('click', openGuide);
+  closeButton.addEventListener('click', dismissGuide);
+  dismissButton.addEventListener('click', dismissGuide);
+  guide.addEventListener('click', function(e){ if (e.target === guide) dismissGuide(); });
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape' && !guide.hidden) { e.preventDefault(); dismissGuide(); return; }
+    if (e.key !== 'Tab' || guide.hidden) return;
+    if (e.shiftKey && document.activeElement === closeButton) { e.preventDefault(); dismissButton.focus(); }
+    else if (!e.shiftKey && document.activeElement === dismissButton) { e.preventDefault(); closeButton.focus(); }
+  });
+  if (!wasDismissed()) openGuide();
+})();
+</script>` : "";
 
   // App-level zoom that persists in localStorage and reapplies on every load,
   // so a hard refresh keeps your zoom. Intercepts Cmd/Ctrl +/-/0 so it is the
@@ -2377,7 +2671,7 @@ ${frontmatterHtml ? frontmatterHtml + "\n" : ""}${bodyHtml}
   <aside class="hl-panel" id="hl-panel">
     <div class="hl-panel-header">
       <div class="hl-panel-title">Highlights <span class="hl-panel-count" id="hl-panel-count"></span></div>
-      <div class="hl-filter-btn active" id="hl-filter-btn">Hide resolved</div>
+      <div class="hl-panel-controls">${guideButtonHtml}<div class="hl-filter-btn active" id="hl-filter-btn">Hide resolved</div></div>
     </div>
     <div id="hl-panel-list"><div class="hl-panel-empty">Select text in the document to highlight passages.</div></div>
   </aside>
@@ -2387,6 +2681,8 @@ ${scrollSpy}
 ${highlightScript}
 ${composerScript}
 ${zoomScript}
+${guideHtml}
+${guideScript}
 <div class="spotlight-brand" aria-label="spotlight-md version ${escapeHtml(VERSION)}">spotlight-md <span>v${escapeHtml(VERSION)}</span></div>
 </body>
 </html>`;
@@ -2441,338 +2737,548 @@ function writeStatic(inputPath, outputPath) {
   console.log(`  wrote ${outputPath}`);
 }
 
-function serveAuto(inputPath, opts, session) {
-  const report = opts.json ? console.error : console.log;
-  let currentHtml = "";
-  let currentTitle = "";
-  let currentFrontmatter = "";
-  let currentToc = "";
-  let mtime = 0;
-  const sseClients = [];
+function daemonStatePath(port) {
+  const configDir = process.env.SPOTLIGHT_MD_CONFIG_DIR || join(homedir(), ".config", "spotlight-md");
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  return join(configDir, `daemon-${port}.json`);
+}
 
-  function rebuild() {
-    try {
-      const { title, html, frontmatterHtml, tocHtml } = renderFile(inputPath);
-      currentTitle = title;
-      currentHtml = html;
-      currentFrontmatter = frontmatterHtml;
-      currentToc = tocHtml;
-      mtime = statSync(inputPath).mtimeMs;
-      report(`  [${new Date().toLocaleTimeString()}] rendered ${inputPath}`);
-    } catch (e) {
-      console.error("  render error:", e.message);
-    }
-  }
+function virtualDocumentRoute(inputPath) {
+  const renderedPath = inputPath.replace(/\.md$/i, ".html");
+  const segments = renderedPath.replace(/\\/g, "/").split("/").filter(Boolean);
+  return "/spotlight/" + segments.map((segment) => encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
 
-  rebuild();
+function normalizeUrlPath(pathname) {
+  return pathname.split("/").map((segment) => encodeURIComponent(decodeURIComponent(segment)).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join("/");
+}
 
-  // Also write a static file alongside
-  const outputPath = opts.output || inputPath.replace(/\.md$/i, ".html");
-  function writeStaticCopy() {
-    try {
-      writeFileSync(outputPath, buildHtml(currentTitle, currentHtml, currentFrontmatter, currentToc, false, opts.theme));
-    } catch (e) { /* ignore */ }
-  }
-  writeStaticCopy();
-
-  function broadcastHighlights() {
-    for (const client of sseClients) {
-      client.write("event: highlights-updated\ndata: {}\n\n");
-    }
-  }
-
-  function broadcastContent() {
-    for (const client of sseClients) {
-      client.write("event: content-updated\ndata: {}\n\n");
-    }
-  }
-
-  function readBody(req) {
-    return new Promise((resolve) => {
-      let data = "";
-      req.on("data", (chunk) => (data += chunk));
-      req.on("end", () => resolve(data));
+function readRequestBody(req, limit = 1024 * 1024) {
+  return new Promise((resolveBody, rejectBody) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > limit) rejectBody(new Error("request body too large"));
     });
-  }
-
-  const server = createServer((req, res) => {
-    const pathname = new URL(req.url || "/", "http://localhost").pathname;
-
-    // SSE channel
-    if (pathname === "/__reload__") {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-      res.write("retry: 2000\n\n");
-      sseClients.push(res);
-      req.on("close", () => {
-        const idx = sseClients.indexOf(res);
-        if (idx !== -1) sseClients.splice(idx, 1);
-      });
-      return;
-    }
-
-    // Highlight REST API
-    if (pathname === "/__session__" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ id: session.id, path: session.path, state: session.state }));
-      return;
-    }
-    if (pathname === "/__highlights__" && req.method === "GET") {
-      const hls = loadHighlightsWithSuggestions(session.id);
-      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify(hls));
-      return;
-    }
-    // Rendered document fragments, for in-place (no-reload) live updates.
-    if (pathname === "/__content__" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ title: currentTitle, bodyHtml: currentHtml, frontmatterHtml: currentFrontmatter, tocHtml: currentToc }));
-      return;
-    }
-    if (pathname === "/__highlights__" && req.method === "POST") {
-      readBody(req).then((body) => {
-        try {
-          const data = JSON.parse(body);
-          if (!data.text || data.text.trim().length < 2) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "text required" }));
-            return;
-          }
-          const hl = addHighlight(session.id, data);
-          res.writeHead(201, {
-            "Content-Type": "application/json",
-            Location: `/__highlights__/${hl.id}`,
-          });
-          res.end(JSON.stringify(hl));
-          broadcastHighlights();
-        } catch (e) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-    // Whole-document directive: a message sent to the AI about the document as
-    // a whole (from the composer under the TOC), stored as a document-scoped
-    // highlight so it flows through the same agent loop and thread UI.
-    if (pathname === "/__directives__" && req.method === "POST") {
-      readBody(req).then((body) => {
-        try {
-          const data = JSON.parse(body);
-          const text = (data.text || "").trim();
-          if (text.length < 2) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "text required" }));
-            return;
-          }
-          const hl = addHighlight(session.id, { text, scope: "document", sectionTitle: "Whole document" });
-          res.writeHead(201, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(hl));
-          broadcastHighlights();
-        } catch (e) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-    const hlIdMatch = pathname.match(/^\/__highlights__\/([^/]+)$/);
-    if (hlIdMatch && req.method === "DELETE") {
-      const id = hlIdMatch[1];
-      const removed = setHighlightResolved(session.id, id, true, true);
-      if (removed) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, id }));
-        broadcastHighlights();
-      } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "not found" }));
-      }
-      return;
-    }
-    if (hlIdMatch && req.method === "PATCH") {
-      const id = hlIdMatch[1];
-      readBody(req).then((body) => {
-        try {
-          JSON.parse(body);
-          res.writeHead(410, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "editing an initial note is not supported" }));
-        } catch (e) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-
-    // Message endpoint: POST /__highlights__/:id/messages  (author defaults to "ai")
-    const msgMatch = pathname.match(/^\/__highlights__\/([^/]+)\/messages$/);
-    if (msgMatch && req.method === "POST") {
-      const id = msgMatch[1];
-      readBody(req).then((body) => {
-        try {
-          const data = JSON.parse(body);
-          if (!data.text || data.text.trim().length < 1) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "text required" }));
-            return;
-          }
-          const author = data.author || "ai";
-          const result = addHighlightMessage(session.id, id, author, data.text.trim(), data.agentId || null);
-          if (result) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result));
-            broadcastHighlights();
-          } else {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "highlight not found" }));
-          }
-        } catch (e) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-
-    // Resolve endpoint: PATCH /__highlights__/:id/resolve
-    const resolveMatch = pathname.match(/^\/__highlights__\/([^/]+)\/resolve$/);
-    if (resolveMatch && req.method === "PATCH") {
-      const id = resolveMatch[1];
-      const hl = setHighlightResolved(session.id, id, true);
-      if (hl) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(hl));
-        broadcastHighlights();
-      } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "not found" }));
-      }
-      return;
-    }
-
-    // Unresolve endpoint: PATCH /__highlights__/:id/unresolve
-    const unresolveMatch = pathname.match(/^\/__highlights__\/([^/]+)\/unresolve$/);
-    if (unresolveMatch && req.method === "PATCH") {
-      const id = unresolveMatch[1];
-      const hl = setHighlightResolved(session.id, id, false);
-      if (hl) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(hl));
-        broadcastHighlights();
-      } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "not found" }));
-      }
-      return;
-    }
-
-    // Suggestion accept: PATCH /__suggestions__/:id/accept
-    const suggAcceptMatch = pathname.match(/^\/__suggestions__\/([^/]+)\/accept$/);
-    if (suggAcceptMatch && req.method === "PATCH") {
-      const id = suggAcceptMatch[1];
-      let result;
-      try { result = acceptSuggestion(session.id, id); }
-      catch (e) { result = { error: e.message }; }
-      if (result.applied) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result.suggestion));
-        broadcastHighlights();
-        // The file write will trigger the watcher → content-updated; nudge it
-        // immediately too so the browser feels instant.
-        rebuild();
-        writeStaticCopy();
-        broadcastContent();
-      } else {
-        res.writeHead(result.error === "not found" ? 404 : 409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: result.error || "could not apply suggestion" }));
-      }
-      return;
-    }
-
-    // Suggestion reject: PATCH /__suggestions__/:id/reject
-    const suggRejectMatch = pathname.match(/^\/__suggestions__\/([^/]+)\/reject$/);
-    if (suggRejectMatch && req.method === "PATCH") {
-      const id = suggRejectMatch[1];
-      const updated = setSuggestionStatus(session.id, id, "rejected");
-      if (updated) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(updated));
-        broadcastHighlights();
-      } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "not found" }));
-      }
-      return;
-    }
-
-    if (pathname === "/__mtime__") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(String(mtime));
-      return;
-    }
-    // Serve the rendered page
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(buildHtml(currentTitle, currentHtml, currentFrontmatter, currentToc, true, opts.theme));
-  });
-
-  server.listen(opts.port, () => {
-    const url = `http://localhost:${opts.port}`;
-    report(`\n  spotlight-md serving ${inputPath}`);
-    report(`  session: ${session.id}${session.resumed ? " (resumed)" : ""}`);
-    report(`  → ${url}\n`);
-    if (opts.open) {
-      try {
-        spawn("open", [url], { stdio: "ignore", detached: true }).unref();
-      } catch (e) { /* ignore */ }
-    }
-  });
-
-  // Watch the file (polling for reliability on macOS/network drives). On
-  // change we re-render and push the new fragments over SSE so the browser
-  // patches the DOM in place — no full reload, so scroll, zoom, text
-  // selection, and applied highlights all survive.
-  let debounceTimer = null;
-  watchFile(inputPath, { interval: 300 }, (curr) => {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      rebuild();
-      writeStaticCopy();
-      broadcastContent();
-    }, 120);
-  });
-
-  // Watch the highlight database so annotations made out-of-process (an AI
-  // agent running the CLI: add-comment, suggest-edit, complete) appear in the
-  // browser live, without needing a document edit to trigger a refresh. WAL
-  // mode writes land in the -wal sidecar, so watch that; fall back to the db.
-  const dbPath = dbFilePath();
-  let dbDebounce = null;
-  const onDbChange = () => {
-    if (dbDebounce) clearTimeout(dbDebounce);
-    dbDebounce = setTimeout(() => broadcastHighlights(), 120);
-  };
-  watchFile(dbPath + "-wal", { interval: 300 }, onDbChange);
-  watchFile(dbPath, { interval: 500 }, onDbChange);
-
-  report("  watching for changes…  (Ctrl-C to stop)\n");
-
-  process.on("SIGINT", () => {
-    unwatchFile(inputPath);
-    unwatchFile(dbPath + "-wal");
-    unwatchFile(dbPath);
-    for (const c of sseClients) c.end();
-    server.close();
-    report("\n  stopped.");
-    process.exit(0);
+    req.on("end", () => resolveBody(data));
+    req.on("error", rejectBody);
   });
 }
 
+function sendJson(res, status, value, extraHeaders = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", ...extraHeaders });
+  res.end(JSON.stringify(value));
+}
+
+function createDocumentState(inputPath, theme, session, onActivity) {
+  const document = {
+    path: inputPath,
+    route: virtualDocumentRoute(inputPath),
+    theme,
+    session,
+    title: "",
+    html: "",
+    frontmatterHtml: "",
+    tocHtml: "",
+    mtime: 0,
+    clients: [],
+    debounceTimer: null,
+    watcher: null,
+    lastActivityAt: null,
+    activitySequence: 0,
+  };
+
+  rebuildDocument(document);
+  document.watcher = () => {
+    if (document.debounceTimer) clearTimeout(document.debounceTimer);
+    document.debounceTimer = setTimeout(() => {
+      try {
+        rebuildDocument(document);
+        onActivity(document);
+        broadcastDocument(document, "content-updated");
+      } catch (error) {
+        console.error(`spotlight-md: could not re-render ${document.path}: ${error.message}`);
+      }
+    }, 150);
+  };
+  watchFile(document.path, { interval: 500 }, document.watcher);
+  return document;
+}
+
+function rebuildDocument(document) {
+  const rendered = renderFile(document.path);
+  document.title = rendered.title;
+  document.html = rendered.html;
+  document.frontmatterHtml = rendered.frontmatterHtml;
+  document.tocHtml = rendered.tocHtml;
+  document.mtime = statSync(document.path).mtimeMs;
+}
+
+function broadcastDocument(document, event) {
+  for (const client of document.clients) client.write(`event: ${event}\ndata: {}\n\n`);
+}
+
+function closeDocumentState(document) {
+  if (document.debounceTimer) clearTimeout(document.debounceTimer);
+  if (document.watcher) unwatchFile(document.path, document.watcher);
+  for (const client of document.clients) client.end();
+  document.clients.length = 0;
+}
+
+async function handleDocumentRequest(document, subpath, req, res, daemonContext) {
+  if (subpath === "" && req.method === "GET") {
+    daemonContext.markActive(document);
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(buildHtml(document.title, document.html, document.frontmatterHtml, document.tocHtml, true, document.theme, document.route, daemonContext.recentDocuments()));
+    return;
+  }
+
+  if (subpath === "/__reload__" && req.method === "GET") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write("retry: 2000\n\n");
+    document.clients.push(res);
+    req.on("close", () => {
+      const index = document.clients.indexOf(res);
+      if (index !== -1) document.clients.splice(index, 1);
+    });
+    return;
+  }
+
+  if (subpath === "/__session__" && req.method === "GET") {
+    sendJson(res, 200, { id: document.session.id, path: document.session.path, state: document.session.state });
+    return;
+  }
+  if (subpath === "/__highlights__" && req.method === "GET") {
+    sendJson(res, 200, loadHighlightsWithSuggestions(document.session.id));
+    return;
+  }
+  // Rendered fragments for in-place (no-reload) live updates.
+  if (subpath === "/__content__" && req.method === "GET") {
+    sendJson(res, 200, { title: document.title, bodyHtml: document.html, frontmatterHtml: document.frontmatterHtml, tocHtml: document.tocHtml });
+    return;
+  }
+  // Whole-document message to the AI (from the composer under the TOC).
+  if (subpath === "/__directives__" && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    const text = (data.text || "").trim();
+    if (text.length < 2) { sendJson(res, 400, { error: "text required" }); return; }
+    const hl = addHighlight(document.session.id, { text, scope: "document", sectionTitle: "Whole document" });
+    daemonContext.markActive(document);
+    sendJson(res, 201, hl);
+    broadcastDocument(document, "highlights-updated");
+    return;
+  }
+  if (subpath === "/__highlights__" && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    if (!data.text || data.text.trim().length < 2) {
+      sendJson(res, 400, { error: "text required" });
+      return;
+    }
+    const highlight = addHighlight(document.session.id, data);
+    daemonContext.markActive(document);
+    sendJson(res, 201, highlight, { Location: `${document.route}/__highlights__/${highlight.id}` });
+    broadcastDocument(document, "highlights-updated");
+    return;
+  }
+
+  const highlightMatch = subpath.match(/^\/__highlights__\/([^/]+)$/);
+  if (highlightMatch && req.method === "DELETE") {
+    const id = highlightMatch[1];
+    const removed = setHighlightResolved(document.session.id, id, true, true);
+    if (!removed) sendJson(res, 404, { error: "not found" });
+    else {
+      daemonContext.markActive(document);
+      sendJson(res, 200, { ok: true, id });
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+  if (highlightMatch && req.method === "PATCH") {
+    sendJson(res, 410, { error: "editing an initial note is not supported" });
+    return;
+  }
+
+  const messageMatch = subpath.match(/^\/__highlights__\/([^/]+)\/messages$/);
+  if (messageMatch && req.method === "POST") {
+    const data = JSON.parse(await readRequestBody(req));
+    if (!data.text || data.text.trim().length < 1) {
+      sendJson(res, 400, { error: "text required" });
+      return;
+    }
+    const result = addHighlightMessage(document.session.id, messageMatch[1], data.author || "ai", data.text.trim(), data.agentId || null);
+    if (!result) sendJson(res, 404, { error: "highlight not found" });
+    else {
+      daemonContext.markActive(document);
+      sendJson(res, 200, result);
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+
+  const resolvedMatch = subpath.match(/^\/__highlights__\/([^/]+)\/(resolve|unresolve)$/);
+  if (resolvedMatch && req.method === "PATCH") {
+    const highlight = setHighlightResolved(document.session.id, resolvedMatch[1], resolvedMatch[2] === "resolve");
+    if (!highlight) sendJson(res, 404, { error: "not found" });
+    else {
+      daemonContext.markActive(document);
+      sendJson(res, 200, highlight);
+      broadcastDocument(document, "highlights-updated");
+    }
+    return;
+  }
+
+  const suggAcceptMatch = subpath.match(/^\/__suggestions__\/([^/]+)\/accept$/);
+  if (suggAcceptMatch && req.method === "PATCH") {
+    let result;
+    try { result = acceptSuggestion(document.session.id, suggAcceptMatch[1]); }
+    catch (e) { result = { error: e.message }; }
+    if (result.applied) {
+      daemonContext.markActive(document);
+      sendJson(res, 200, result.suggestion);
+      broadcastDocument(document, "highlights-updated");
+      // The file write triggers the watcher too, but nudge immediately so it feels instant.
+      try { rebuildDocument(document); } catch (e) { /* ignore */ }
+      broadcastDocument(document, "content-updated");
+    } else {
+      sendJson(res, result.error === "not found" ? 404 : 409, { error: result.error || "could not apply suggestion" });
+    }
+    return;
+  }
+  const suggRejectMatch = subpath.match(/^\/__suggestions__\/([^/]+)\/reject$/);
+  if (suggRejectMatch && req.method === "PATCH") {
+    const updated = setSuggestionStatus(document.session.id, suggRejectMatch[1], "rejected");
+    if (updated) {
+      daemonContext.markActive(document);
+      sendJson(res, 200, updated);
+      broadcastDocument(document, "highlights-updated");
+    } else {
+      sendJson(res, 404, { error: "not found" });
+    }
+    return;
+  }
+
+  if (subpath === "/__mtime__" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+    res.end(String(document.mtime));
+    return;
+  }
+
+  sendJson(res, 404, { error: "not found" });
+}
+
+function serveDaemon(daemonOpts) {
+  const token = process.env.SPOTLIGHT_MD_DAEMON_TOKEN || randomBytes(24).toString("hex");
+  const statePath = daemonStatePath(daemonOpts.port);
+  const documentsByRoute = new Map();
+  const documentsByPath = new Map();
+  const startedAt = new Date().toISOString();
+  let activitySequence = 0;
+  let shuttingDown = false;
+
+  function markActive(document) {
+    document.activitySequence = ++activitySequence;
+    document.lastActivityAt = new Date().toISOString();
+  }
+
+  function recentDocuments() {
+    return [...documentsByPath.values()]
+      .sort((left, right) => right.activitySequence - left.activitySequence)
+      .map((document) => ({
+        path: document.path,
+        route: document.route,
+        sessionId: document.session.id,
+        lastActivityAt: document.lastActivityAt,
+      }));
+  }
+
+  const daemonContext = { markActive, recentDocuments };
+
+  // Watch the highlight DB so CLI-driven changes (comments, suggestions, claims)
+  // appear live in every open document without needing a source edit.
+  const highlightsDbPath = dbFilePath();
+  let dbDebounce = null;
+  const onDbChange = () => {
+    if (dbDebounce) clearTimeout(dbDebounce);
+    dbDebounce = setTimeout(() => {
+      for (const document of documentsByPath.values()) broadcastDocument(document, "highlights-updated");
+    }, 120);
+  };
+  watchFile(highlightsDbPath + "-wal", { interval: 300 }, onDbChange);
+  watchFile(highlightsDbPath, { interval: 500 }, onDbChange);
+
+  function isAuthorized(req) {
+    return req.headers["x-spotlight-token"] === token;
+  }
+
+  function status() {
+    return {
+      service: "spotlight-md",
+      version: VERSION,
+      running: true,
+      pid: process.pid,
+      port: daemonOpts.port,
+      startedAt,
+      documents: recentDocuments(),
+    };
+  }
+
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || "/", "http://localhost");
+      const pathname = normalizeUrlPath(url.pathname);
+      if (pathname === "/__spotlight__/health" && req.method === "GET") {
+        sendJson(res, 200, { service: "spotlight-md", version: VERSION });
+        return;
+      }
+      if (pathname === "/__spotlight__/status" && req.method === "GET") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        sendJson(res, 200, status());
+        return;
+      }
+      if (pathname === "/__spotlight__/register" && req.method === "POST") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        const registration = JSON.parse(await readRequestBody(req));
+        if (!registration.path || typeof registration.path !== "string") {
+          sendJson(res, 400, { error: "path required" });
+          return;
+        }
+        const canonicalPath = realpathSync(registration.path);
+        if (!statSync(canonicalPath).isFile()) {
+          sendJson(res, 400, { error: "path must be a file" });
+          return;
+        }
+        const session = getOrCreateSession(canonicalPath, !!registration.newSession);
+        let document = documentsByPath.get(canonicalPath);
+        if (document) {
+          document.theme = registration.theme || "github-dark";
+          document.session = session;
+          rebuildDocument(document);
+          markActive(document);
+          broadcastDocument(document, "reload");
+        } else {
+          document = createDocumentState(canonicalPath, registration.theme || "github-dark", session, markActive);
+          if (documentsByRoute.has(document.route)) throw new Error("document route collision");
+          documentsByPath.set(canonicalPath, document);
+          documentsByRoute.set(document.route, document);
+          markActive(document);
+        }
+        sendJson(res, 200, {
+          sessionId: session.id,
+          path: canonicalPath,
+          resumed: session.resumed,
+          route: document.route,
+          url: `http://localhost:${daemonOpts.port}${document.route}`,
+        });
+        return;
+      }
+      if (pathname === "/__spotlight__/stop" && req.method === "POST") {
+        if (!isAuthorized(req)) {
+          sendJson(res, 403, { error: "forbidden" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, pid: process.pid });
+        setTimeout(shutdown, 10);
+        return;
+      }
+
+      let matchedDocument = documentsByRoute.get(pathname);
+      let subpath = "";
+      if (!matchedDocument) {
+        for (const [route, document] of documentsByRoute) {
+          if (pathname.startsWith(route + "/__")) {
+            matchedDocument = document;
+            subpath = pathname.slice(route.length);
+            break;
+          }
+        }
+      }
+      if (!matchedDocument) {
+        sendJson(res, 404, { error: "document is not registered" });
+        return;
+      }
+      await handleDocumentRequest(matchedDocument, subpath, req, res, daemonContext);
+    } catch (error) {
+      if (!res.headersSent) sendJson(res, error instanceof URIError ? 400 : 500, { error: error.message });
+      else res.end();
+    }
+  });
+
+  function removeOwnStateFile() {
+    try {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      if (state.pid === process.pid && state.token === token) unlinkSync(statePath);
+    } catch { /* State may already be absent or replaced by another daemon. */ }
+  }
+
+  function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    unwatchFile(highlightsDbPath + "-wal", onDbChange);
+    unwatchFile(highlightsDbPath, onDbChange);
+    for (const document of documentsByPath.values()) closeDocumentState(document);
+    removeOwnStateFile();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  }
+
+  server.on("error", (error) => {
+    console.error(`spotlight-md: daemon could not listen on port ${daemonOpts.port}: ${error.message}`);
+    process.exit(1);
+  });
+  server.listen(daemonOpts.port, "127.0.0.1", () => {
+    writeFileSync(statePath, JSON.stringify({ pid: process.pid, port: daemonOpts.port, token, startedAt }) + "\n", { mode: 0o600 });
+    chmodSync(statePath, 0o600);
+  });
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+function readDaemonState(port) {
+  try {
+    const state = JSON.parse(readFileSync(daemonStatePath(port), "utf8"));
+    if (state.port !== port || !Number.isInteger(state.pid) || typeof state.token !== "string") return null;
+    return state;
+  } catch {
+    return null;
+  }
+}
+
+function removeStaleDaemonState(port) {
+  try { unlinkSync(daemonStatePath(port)); }
+  catch { /* A missing state file is already clean. */ }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 1000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeDaemon(port) {
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/__spotlight__/health`);
+    const body = await response.json().catch(() => null);
+    return body && body.service === "spotlight-md" ? "running" : "occupied";
+  } catch {
+    return "stopped";
+  }
+}
+
+async function daemonRequest(port, state, pathname, method = "GET", body = undefined) {
+  const response = await fetchWithTimeout(`http://127.0.0.1:${port}${pathname}`, {
+    method,
+    headers: {
+      "X-Spotlight-Token": state.token,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }, 5000);
+  const value = await response.json().catch(() => ({ error: `daemon returned HTTP ${response.status}` }));
+  if (!response.ok) throw new Error(value.error || `daemon returned HTTP ${response.status}`);
+  return value;
+}
+
+async function ensureDaemon(port) {
+  const initialProbe = await probeDaemon(port);
+  if (initialProbe === "running") {
+    const state = readDaemonState(port);
+    if (!state) throw new Error(`daemon is running on port ${port}, but its control file is unavailable`);
+    await daemonRequest(port, state, "/__spotlight__/status");
+    return state;
+  }
+  if (initialProbe === "occupied") throw new Error(`port ${port} is already used by another service`);
+
+  removeStaleDaemonState(port);
+  const token = randomBytes(24).toString("hex");
+  const child = spawn(process.execPath, [resolve(process.argv[1]), "--daemon", "--port", String(port)], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, SPOTLIGHT_MD_DAEMON_TOKEN: token },
+  });
+  child.on("error", () => {});
+  child.unref();
+
+  for (let attempt = 0; attempt < 60; attempt++) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    const probe = await probeDaemon(port);
+    if (probe === "occupied") throw new Error(`port ${port} became occupied by another service`);
+    if (probe === "running") {
+      const state = readDaemonState(port);
+      if (state) {
+        try {
+          await daemonRequest(port, state, "/__spotlight__/status");
+          return state;
+        } catch { /* The winning daemon may still be publishing its control state. */ }
+      }
+    }
+  }
+  throw new Error(`timed out starting daemon on port ${port}`);
+}
+
+function openBrowser(url) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { stdio: "ignore", detached: true });
+  child.on("error", () => {});
+  child.unref();
+}
+
+async function registerWithDaemon(inputPath, registrationOpts) {
+  const state = await ensureDaemon(registrationOpts.port);
+  return daemonRequest(registrationOpts.port, state, "/__spotlight__/register", "POST", {
+    path: inputPath,
+    theme: registrationOpts.theme,
+    newSession: registrationOpts.newSession,
+  });
+}
+
+async function daemonStatus(port) {
+  const probe = await probeDaemon(port);
+  if (probe !== "running") {
+    if (probe === "stopped") removeStaleDaemonState(port);
+    return { service: "spotlight-md", running: false, port, reason: probe === "occupied" ? "port occupied by another service" : undefined };
+  }
+  const state = readDaemonState(port);
+  if (!state) throw new Error(`daemon is running on port ${port}, but its control file is unavailable`);
+  return daemonRequest(port, state, "/__spotlight__/status");
+}
+
+async function stopDaemon(port) {
+  const current = await daemonStatus(port);
+  if (!current.running) return { ok: false, running: false, port };
+  const state = readDaemonState(port);
+  return daemonRequest(port, state, "/__spotlight__/stop", "POST");
+}
+
+
 // ── Entry ──────────────────────────────────────────────────────────────────
 const opts = parseArgs(process.argv.slice(2));
+
+if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+  console.error("spotlight-md: --port must be an integer between 1 and 65535");
+  process.exit(1);
+}
+
+// The persistent multi-document daemon process.
+if (opts.daemon) {
+  serveDaemon(opts);
+  await new Promise(() => {});
+}
 
 // ── Prime: AI agent instructions ───────────────────────────────────────────
 if (opts.prime) {
@@ -2939,6 +3445,16 @@ async function waitForUpdates(sessionId, agentId) {
 
 try {
   if (opts.command) {
+    if (opts.command === "status") {
+      const current = await daemonStatus(opts.port);
+      emit(current);
+      process.exit(current.running ? 0 : 1);
+    }
+    if (opts.command === "stop") {
+      const stopped = await stopDaemon(opts.port);
+      emit(stopped);
+      process.exit(stopped.ok ? 0 : 1);
+    }
     const session = requireSession();
     if (opts.command === "list-highlights") {
       emit(loadHighlights(session.id).map((h) => ({ id: h.id, text: h.text.slice(0, 120), commentCount: h.messages.length, status: h.completed ? "completed" : h.resolved ? "resolved" : "open", createdAt: h.createdAt })));
@@ -2997,13 +3513,23 @@ try {
     process.exit(0);
   }
 
-  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md list-highlights --session-id ID");
+  if (opts.files.length === 0) throw new Error("Usage: spotlight-md --auto FILE.md | spotlight-md -o OUTPUT.html FILE.md | spotlight-md status");
+  if (opts.files.length > 1) throw new Error("exactly one Markdown file is supported per invocation");
   const inputPath = resolve(opts.files[0]);
   statSync(inputPath);
   if (opts.auto) {
-    const session = getOrCreateSession(inputPath, opts.newSession);
-    if (opts.json) console.log(JSON.stringify({ sessionId: session.id, path: session.path, resumed: session.resumed, url: `http://localhost:${opts.port}` }));
-    serveAuto(inputPath, opts, session);
+    if (opts.output) throw new Error("--auto and --output cannot be combined; use -o without --auto for a static export");
+    // Register the document with the persistent daemon (starting it if needed),
+    // then hand back its virtual route. Each registered document keeps its own
+    // review session, live-reload channel, and highlight/suggestion state.
+    const registration = await registerWithDaemon(inputPath, opts);
+    if (opts.json) console.log(JSON.stringify(registration));
+    else {
+      console.log(`  spotlight-md registered ${registration.path}`);
+      console.log(`  session: ${registration.sessionId}${registration.resumed ? " (resumed)" : ""}`);
+      console.log(`  → ${registration.url}`);
+    }
+    if (opts.open) openBrowser(registration.url);
   } else {
     const outputPath = resolve(opts.output || inputPath.replace(/\.md$/i, ".html"));
     writeStatic(inputPath, outputPath);

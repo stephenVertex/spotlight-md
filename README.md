@@ -1,6 +1,6 @@
 # spotlight-md
 
-Version: **0.5.0**
+Version: **0.6.1**
 
 Dark-themed markdown viewer with live reload, LaTeX-style numbered sections, highlight annotations, live AI-suggested edits, whole-document AI messaging, and live "AI is working" indicators for AI-assisted document review.
 
@@ -14,10 +14,14 @@ Releases follow [Semantic Versioning](https://semver.org/); see [CHANGELOG.md](C
 ## Quick start
 
 ```bash
-# Serve a markdown file with live reload in your browser
+# Register a Markdown file with the persistent local review server
 spotlight-md --auto --json --theme dracula path/to/document.md
 
-# Or write a static HTML file
+# Inspect or stop the server
+spotlight-md status
+spotlight-md stop
+
+# Write a standalone static HTML file instead
 spotlight-md -o output.html path/to/document.md
 ```
 
@@ -25,10 +29,12 @@ spotlight-md -o output.html path/to/document.md
 
 ```
 spotlight-md file.md                Write file.html
-spotlight-md --auto file.md         Serve, watch, and live-reload in browser
+spotlight-md --auto file.md         Register, watch, and open in browser
 spotlight-md -o out.html file.md    Specify output path
 spotlight-md --port 4040 --auto file.md
 spotlight-md --no-open --auto file.md   Don't auto-open browser
+spotlight-md status [--port 4040]   Show server and registered documents
+spotlight-md stop [--port 4040]     Stop the persistent server
 
 spotlight-md list-highlights --session-id sp-… --json
 spotlight-md get-new-comments --session-id sp-… --agent-id codex-… --wait --json
@@ -45,9 +51,9 @@ spotlight-md --version
 
 | Option | Description |
 |--------|-------------|
-| `--auto`, `-a` | Start local server + watch for live reload |
+| `--auto`, `-a` | Launch/reuse the local server, register the document, and open its route |
 | `--port`, `-p NUM` | Server port (default 7231) |
-| `--output`, `-o PATH` | Output file path (default: `<input>.html`) |
+| `--output`, `-o PATH` | Static export path; cannot be combined with `--auto` |
 | `--no-open` | Don't open browser automatically |
 | `--theme`, `-t NAME` | Color scheme: `github-dark` (default) or `dracula` |
 | `--new-session` | Start a fresh review session instead of resuming the document’s active session |
@@ -64,13 +70,21 @@ Two built-in themes: **github-dark** (default) and **dracula**. Pass `--theme dr
 
 A sticky left sidebar lists all headings (h1-h3) with scroll-spy highlighting that tracks your position in the document. Click any heading to jump to it. Sections are numbered LaTeX-style (each `##` is section N, each `###` is N.M) in both the document and the TOC, so you can refer to "section 2.1" — including in whole-document messages, where the agent receives the live numbered outline to resolve the reference.
 
+On the shared `--auto` server, the sidebar also lists recently active registered documents. Each entry shows its filename and canonical path; selecting one opens its registered virtual route with that document's active review session and highlights. Registrations, document visits, source edits, and highlight activity move a document to the top of the list. Files that have not been registered with the running server are never included.
+
 ### Frontmatter card
 
 If the document begins with a metadata block of `**Label:** value` lines after the H1, they are rendered as a clean label/value card at the top of the page.
 
 ### Live reload
 
-In `--auto` mode, the server watches the markdown file. When you (or an AI agent) save changes, the page updates **in place** via Server-Sent Events — no full reload — so your scroll position, zoom, text selection, and applied highlights all survive the update. The server also watches the highlight database, so comments and suggestions an AI agent makes via the CLI appear in the browser instantly.
+In `--auto` mode, one persistent daemon watches every registered Markdown file. When you (or an AI agent) save a document, the page updates **in place** via that document's Server-Sent Events channel — no full reload — so your scroll position, zoom, text selection, and applied highlights all survive the update. The daemon also watches the highlight database, so comments and suggestions an AI agent makes via the CLI appear in the browser instantly.
+
+### Persistent server and virtual routes
+
+`--auto` starts the daemon on `127.0.0.1:7231` when needed, reuses it on later invocations, registers the canonical document path, opens that document’s URL, and then exits. Each document gets an encoded virtual route such as `/spotlight/Users/example/project/review.html`; spaces, Unicode, `%`, `#`, and other special characters are safely percent-encoded. A registered document keeps its own review session, live-reload channel, and highlight/suggestion state.
+
+Virtual routes are registry lookups, not filesystem path resolvers. A URL can read only a file previously registered by a local `--auto` invocation. Daemon registration and shutdown also require a random control token kept in the user-only configuration directory. Use `spotlight-md status` to see the daemon PID and registered documents, and `spotlight-md stop` to stop it cleanly. Pass the same `--port` to lifecycle commands when using a non-default port.
 
 ### Suggested edits
 
@@ -122,4 +136,4 @@ Highlights include the exact passage text, the nearest section heading, and any 
 
 `--auto` resumes the active session for its canonical document path and prints its ID. Use `--new-session` to begin a new review round. `close-session` freezes the review and emits a Markdown audit summary with document changes and the full highlight/message trail. Use `reopen-session` only when you intentionally want to continue a closed review.
 
-No highlight data is written into the document’s repository. A static HTML render is still written next to the document when serving.
+No highlight data or rendered HTML is written into the document’s repository in auto mode. Use `-o` without `--auto` when you want a standalone static HTML export.
