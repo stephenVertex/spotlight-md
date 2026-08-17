@@ -89,8 +89,11 @@ function dbFilePath() {
 function openDb() {
   const dbPath = dbFilePath();
   const db = new DatabaseSync(dbPath);
-  db.exec("PRAGMA journal_mode = WAL");
+  // Set busy_timeout FIRST so the journal_mode pragma (which needs a brief lock)
+  // waits for a concurrent writer instead of failing immediately with
+  // SQLITE_BUSY under contention.
   db.exec("PRAGMA busy_timeout = 5000");
+  db.exec("PRAGMA journal_mode = WAL");
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY, document_path TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active',
@@ -2713,13 +2716,24 @@ function requireSession() {
 
 function emit(value) { console.log(opts.json ? JSON.stringify(value) : typeof value === "string" ? value : JSON.stringify(value, null, 2)); }
 
+// Read unread updates, tolerating transient SQLite lock contention (the server,
+// the CLI, and the DB watcher all touch the same database). A momentary
+// SQLITE_BUSY must not kill a long-lived `get-new-comments --wait`.
+function getUnreadSafe(sessionId, agentId) {
+  try { return getUnread(sessionId, agentId); }
+  catch (e) {
+    if (e && (e.errcode === 5 || e.errcode === 6 || /locked|busy/i.test(e.message || ""))) return null;
+    throw e;
+  }
+}
+
 async function waitForUpdates(sessionId, agentId) {
-  let updates = getUnread(sessionId, agentId);
-  if (updates.length || !opts.wait) return updates;
+  let updates = getUnreadSafe(sessionId, agentId);
+  if ((updates && updates.length) || !opts.wait) return updates || [];
   return new Promise((resolveWait) => {
     const timer = setInterval(() => {
-      updates = getUnread(sessionId, agentId);
-      if (updates.length) { clearInterval(timer); resolveWait(updates); }
+      const u = getUnreadSafe(sessionId, agentId);
+      if (u && u.length) { clearInterval(timer); resolveWait(u); }
     }, 250);
   });
 }
