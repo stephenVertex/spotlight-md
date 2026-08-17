@@ -279,6 +279,49 @@ test("ai-agent-claim surfaces a thinking state that a response clears", async (t
   assert.equal((await (await fetch(`${url}/__highlights__`)).json())[0].aiState, null);
 });
 
+test("whole-document directives reach the agent loop as document-scoped items", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "spotlight-md-directive-"));
+  const inputPath = join(dir, "doc.md");
+  const configDir = join(dir, "config");
+  const env = { SPOTLIGHT_MD_CONFIG_DIR: configDir };
+  const port = await unusedPort();
+  const url = `http://127.0.0.1:${port}`;
+  writeFileSync(inputPath, "# Doc\n\nSection one.\n\nSection two.\n");
+
+  const child = spawn(process.execPath, [toolPath, "--auto", "--no-open", "--port", String(port), inputPath], {
+    stdio: "ignore", env: { ...process.env, ...env },
+  });
+  t.after(async () => { await stop(child); rmSync(dir, { recursive: true, force: true }); });
+  await waitForServer(url, child);
+
+  const session = await (await fetch(`${url}/__session__`)).json();
+
+  // Composer posts a whole-document directive.
+  const res = await fetch(`${url}/__directives__`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "add a joke to the end of each section" }),
+  });
+  assert.equal(res.status, 201);
+  const directive = await res.json();
+  assert.equal(directive.scope, "document");
+  assert.match(directive.id, /^dm-/);
+
+  // It surfaces to the agent loop like any other unread item.
+  const unread = JSON.parse(cli(["get-new-comments", "--session-id", session.id, "--agent-id", "codex-test", "--json"], env).stdout);
+  const found = unread.find((h) => h.id === directive.id);
+  assert.ok(found, "directive should be unread work for the agent");
+  assert.equal(found.scope, "document");
+  assert.equal(found.text, "add a joke to the end of each section");
+
+  // The agent can respond and suggest edits against it.
+  assert.equal(cli(["add-comment", "--session-id", session.id, "--highlight-id", directive.id, "--agent-id", "codex-test", "--comment", "On it.", "--json"], env).status, 0);
+  const sug = JSON.parse(cli(["suggest-edit", "--session-id", session.id, "--highlight-id", directive.id, "--anchor", "Section one.", "--replacement", "Section one. (ha!)", "--json"], env).stdout);
+  const hls = await (await fetch(`${url}/__highlights__`)).json();
+  const d = hls.find((h) => h.id === directive.id);
+  assert.equal(d.suggestions.length, 1);
+  assert.equal(d.suggestions[0].id, sug.suggestion.id);
+});
+
 test("prime documents the suggest-edit workflow for agents", () => {
   const result = cli(["prime"], {});
   assert.equal(result.status, 0, result.stderr);

@@ -2,6 +2,13 @@
 
 All notable changes to spotlight-md follow [Semantic Versioning](https://semver.org/).
 
+## 0.4.0 — 2026-08-17
+
+- Added a whole-document composer in the bottom-left (below the TOC): type a message to the AI about the document as a whole (e.g. "add a joke to the end of each section"). It becomes a document-scoped item that flows through the same agent loop; the agent typically responds with one suggestion per location, each independently approvable inline. New `POST /__directives__` endpoint and `dm-`-prefixed document-scoped highlights.
+- Fixed selection/suggestion popups landing far from the passage under app zoom (fixed-position elements are scaled by the root `zoom`); popups now divide viewport coordinates by the zoom factor.
+- Serialized the browser's annotation renders so a burst of updates can't interleave and drop marks.
+- `prime` now documents whole-document directives and corrects the anchor guidance (matching is whitespace/wrap-tolerant; the highlight's own text is the best anchor). Removed a dead second prime block describing a long-removed workflow.
+
 ## 0.3.0 — 2026-08-16
 
 - Added a persistent zoom control: zoom in/out (buttons or Ctrl/Cmd +/−/0) is remembered in `localStorage` and reapplied on every load, so a hard refresh keeps your zoom.

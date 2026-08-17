@@ -1,8 +1,8 @@
 # spotlight-md
 
-Version: **0.3.0**
+Version: **0.4.0**
 
-Dark-themed markdown viewer with live reload, sidebar TOC, highlight annotations, live AI-suggested edits, and live "AI is working" indicators for AI-assisted document review.
+Dark-themed markdown viewer with live reload, sidebar TOC, highlight annotations, live AI-suggested edits, whole-document AI messaging, and live "AI is working" indicators for AI-assisted document review.
 
 ## Install
 
@@ -88,6 +88,10 @@ The suggestion appears live in the browser, Google-Docs style: the highlighted p
 ### AI activity indicators
 
 When an agent starts working on a highlight it "claims" it with `ai-agent-claim`, which pulses that exact passage **yellow** in the browser (and marks its panel card as *thinking*) so you can see, at a glance, what the AI is currently working on. The claim releases automatically when the agent replies, suggests an edit, or completes the highlight — and the passage briefly flashes **green** to signal a fresh response. This makes the back-and-forth legible: the AI loops through your highlights while you watch its progress in real time.
+
+### Whole-document messages
+
+A composer in the bottom-left (below the table of contents) lets you send the AI a message about the document as a whole — e.g. *"add a joke to the end of each section"* or *"add a paragraph about accessibility."* Unlike a highlight, it isn't tied to a passage: it flows to the agent as a document-scoped item, and the agent typically responds with one suggested edit per location, each of which you approve or dismiss independently.
 
 ### Persistent zoom
 

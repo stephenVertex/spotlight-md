@@ -148,6 +148,10 @@ function openDb() {
       PRIMARY KEY (session_id, highlight_id)
     );
   `);
+  // Migration: highlights may be text-anchored (default) or 'document'-scoped
+  // whole-document directives sent from the composer. Add the column if missing.
+  try { db.exec("ALTER TABLE highlights ADD COLUMN scope TEXT NOT NULL DEFAULT 'text'"); }
+  catch (e) { /* column already exists */ }
   return db;
 }
 
@@ -187,7 +191,7 @@ function loadHighlights(sessionId) {
   const db = openDb();
   try {
     const rows = db.prepare(`
-      SELECT id, text, section_id, section_title, resolved, completed, created_at, completed_at
+      SELECT id, text, section_id, section_title, resolved, completed, created_at, completed_at, scope
       FROM highlights WHERE session_id = ? ORDER BY created_at
     `).all(sessionId);
     return rows.map((r) => {
@@ -200,6 +204,7 @@ function loadHighlights(sessionId) {
         text: r.text,
         sectionId: r.section_id,
         sectionTitle: r.section_title,
+        scope: r.scope || "text",
         resolved: !!r.resolved,
         completed: !!r.completed,
         createdAt: r.created_at,
@@ -216,12 +221,13 @@ function addHighlight(sessionId, data) {
   requireActiveSession(sessionId);
   const db = openDb();
   try {
-    const id = genId("hl-");
+    const scope = data.scope === "document" ? "document" : "text";
+    const id = genId(scope === "document" ? "dm-" : "hl-");
     const now = new Date().toISOString();
     db.prepare(`
-      INSERT INTO highlights (id, session_id, text, section_id, section_title, resolved, completed, created_at)
-      VALUES (?, ?, ?, ?, ?, 0, 0, ?)
-    `).run(id, sessionId, data.text, data.sectionId || null, data.sectionTitle || null, now);
+      INSERT INTO highlights (id, session_id, text, section_id, section_title, resolved, completed, created_at, scope)
+      VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+    `).run(id, sessionId, data.text, data.sectionId || null, data.sectionTitle || null, now, scope);
     let messages = [];
     if (data.note) {
       const msgId = "msg-" + randomBytes(3).toString("hex");
@@ -231,7 +237,7 @@ function addHighlight(sessionId, data) {
       `).run(msgId, id, data.note, now);
       messages = [{ id: msgId, author: "human", text: data.note, createdAt: now, seq: 0 }];
     }
-    return { id, text: data.text, sectionId: data.sectionId, sectionTitle: data.sectionTitle, resolved: false, completed: false, createdAt: now, messages };
+    return { id, text: data.text, sectionId: data.sectionId, sectionTitle: data.sectionTitle, scope, resolved: false, completed: false, createdAt: now, messages };
   } finally {
     db.close();
   }
@@ -891,6 +897,64 @@ tr:nth-child(even) td { background: var(--table-row-alt); }
   cursor: pointer;
 }
 .zoom-level:hover { color: var(--text); }
+/* Whole-document composer (bottom-left, below the TOC) */
+.doc-composer {
+  position: fixed;
+  left: 12px;
+  bottom: 72px;
+  width: 244px;
+  max-width: calc(100vw - 24px);
+  z-index: 8000;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-secondary) 96%, transparent);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+}
+.doc-composer-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.doc-composer textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 44px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  outline: none;
+}
+.doc-composer textarea:focus { border-color: var(--accent); }
+.doc-composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+}
+.doc-composer-status { font-size: 10px; color: var(--text-muted); flex: 1; min-width: 0; }
+.doc-composer-send {
+  font-size: 12px; font-weight: 600;
+  padding: 4px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+.doc-composer-send:hover { filter: brightness(1.08); }
+.doc-composer-send:disabled { opacity: 0.6; cursor: default; }
+@media (max-width: 900px) { .doc-composer { display: none; } }
 /* Highlights */
 mark.mdhtml-hl {
   background: var(--accent-dim);
@@ -1069,6 +1133,18 @@ mark.mdhtml-hl:hover {
 .hl-card:hover {
   border-color: var(--accent);
   background: var(--accent-dim);
+}
+.hl-card.directive {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-secondary));
+}
+.hl-card-directive-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 5px;
 }
 .hl-card-text {
   font-size: 12px;
@@ -1388,7 +1464,10 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
   var hideResolved = true;
 
   // -- Apply a single highlight to the DOM --
-  function applyHighlight(hl) {
+  // Find the first occurrence of searchText across the document's text nodes
+  // and wrap it in one <mark> per spanned text node. decorate(mark) sets the
+  // class/dataset. Returns the array of created marks, or null if not found.
+  function wrapTextOccurrence(searchText, decorate) {
     var walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT, {
       acceptNode: function(node) {
         var p = node.parentElement;
@@ -1407,9 +1486,9 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       nodeMap.push({node: textNodes[i], start: fullText.length, end: fullText.length + textNodes[i].textContent.length});
       fullText += textNodes[i].textContent;
     }
-    var idx = fullText.indexOf(hl.text);
-    if (idx === -1) return false;
-    var endIdx = idx + hl.text.length;
+    var idx = fullText.indexOf(searchText);
+    if (idx === -1) return null;
+    var endIdx = idx + searchText.length;
     var startNode = null, startOff = 0, endNode = null, endOff = 0;
     for (var i = 0; i < nodeMap.length; i++) {
       if (!startNode && nodeMap[i].start <= idx && nodeMap[i].end >= idx) {
@@ -1419,12 +1498,12 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         endNode = nodeMap[i].node; endOff = endIdx - nodeMap[i].start; break;
       }
     }
-    if (!startNode || !endNode) return false;
+    if (!startNode || !endNode) return null;
+    var marks = [];
     try {
       // Wrap each text node segment individually instead of using
       // extractContents across block boundaries (which creates invalid
-      // HTML and extra spacing). We split text nodes and wrap each
-      // affected portion in its own <mark>.
+      // HTML and extra spacing).
       var started = false;
       for (var i = 0; i < nodeMap.length; i++) {
         var entry = nodeMap[i];
@@ -1436,19 +1515,26 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
         if (s >= e) { if (entry.node === endNode) break; continue; }
         var textNode = entry.node;
         var parent = textNode.parentNode;
-        // Split off the part after the highlight
         var afterPart = textNode.splitText(e);
-        // splitText on the start offset gives us the highlight portion as textNode
         var highlightPart = textNode.splitText(s);
         var mark = document.createElement('mark');
-        mark.className = 'mdhtml-hl';
-        mark.dataset.hlId = hl.id;
+        decorate(mark);
         mark.textContent = highlightPart.textContent;
         parent.replaceChild(mark, highlightPart);
+        marks.push(mark);
         if (entry.node === endNode) break;
       }
-      return true;
-    } catch(e) { return false; }
+      return marks.length ? marks : null;
+    } catch(e) { return null; }
+  }
+
+  function applyHighlight(hl) {
+    // Whole-document directives have no passage to anchor in the text.
+    if (hl.scope === 'document') return false;
+    return !!wrapTextOccurrence(hl.text, function(mark){
+      mark.className = 'mdhtml-hl';
+      mark.dataset.hlId = hl.id;
+    });
   }
 
   function clearHighlights() {
@@ -1541,6 +1627,9 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       if (h.completed) cardClass += ' completed';
       else if (h.resolved) cardClass += ' resolved';
       if (h.aiState === 'thinking') cardClass += ' ai-thinking';
+      if (h.scope === 'document') cardClass += ' directive';
+
+      var directiveTag = h.scope === 'document' ? '<div class="hl-card-directive-tag">\\u2728 Message to the AI</div>' : '';
 
       var aiStateHtml = h.aiState === 'thinking' ? '<span class="hl-card-aistate">thinking</span>' : '';
 
@@ -1594,6 +1683,7 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       }
 
       html += '<div class="' + cardClass + '" data-hl-id="' + h.id + '">'
+        + directiveTag
         + '<div class="hl-card-text">' + escapeText(preview) + '</div>'
         + '<div class="hl-card-meta"><span class="hl-card-id">' + h.id + '</span><span class="hl-card-section">' + section + '</span>' + aiStateHtml + statusHtml + resolveBtn + '</div>'
         + threadHtml
@@ -1685,6 +1775,21 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     hls.forEach(function(h){
       var pending = (h.suggestions || []).filter(function(s){ return s.status === 'pending'; });
       if (!pending.length) return;
+      if (h.scope === 'document') {
+        // A whole-document directive has no single passage; anchor each of its
+        // suggestions to its own target text wherever that appears.
+        pending.forEach(function(s){
+          var marks = wrapTextOccurrence(s.anchor, function(mark){
+            mark.className = 'mdhtml-hl has-suggestion';
+            mark.dataset.hlId = h.id;
+            mark.dataset.suggId = s.id;
+          });
+          if (marks) marks.forEach(function(m){
+            m.addEventListener('mouseenter', function(){ showSuggPopover(m, s); });
+          });
+        });
+        return;
+      }
       var marks = content.querySelectorAll('mark.mdhtml-hl[data-hl-id="' + h.id + '"]');
       if (!marks.length) return;
       marks.forEach(function(m){ m.classList.add('has-suggestion'); });
@@ -1776,7 +1881,13 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     });
   }
 
+  // Serialize renders: rapid SSE updates (e.g. an agent posting several
+  // suggestions in a burst) would otherwise let concurrent fetches interleave
+  // and clobber each other's DOM edits. Run one at a time; coalesce the rest.
+  var loadInFlight = false, loadQueued = false;
   function loadAndApply() {
+    if (loadInFlight) { loadQueued = true; return; }
+    loadInFlight = true;
     fetch('/__highlights__').then(function(r){return r.json()}).then(function(hls){
       clearInlineSuggestions();
       clearHighlights();
@@ -1784,7 +1895,10 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       applyInlineSuggestions(hls);
       applyAiActivity(hls);
       renderPanel(hls);
-    }).catch(function(){});
+    }).catch(function(){}).finally(function(){
+      loadInFlight = false;
+      if (loadQueued) { loadQueued = false; loadAndApply(); }
+    });
   }
 
   // AI activity overlays: pulse a highlight yellow while the agent has claimed
@@ -2048,6 +2162,46 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 })();
 </script>` : "";
 
+  // Whole-document composer: send the AI a message about the document as a
+  // whole (e.g. "add a joke to the end of each section"). Sits in the
+  // bottom-left, below the table of contents.
+  const composerScript = autoMode ? `<div class="doc-composer" id="doc-composer">
+  <div class="doc-composer-label">&#10024; Message the AI about the whole doc</div>
+  <textarea id="doc-composer-input" rows="2" placeholder="e.g. add a joke to the end of each section"></textarea>
+  <div class="doc-composer-row">
+    <span class="doc-composer-status" id="doc-composer-status"></span>
+    <button class="doc-composer-send" id="doc-composer-send">Send</button>
+  </div>
+</div>
+<script>
+(function(){
+  var input = document.getElementById('doc-composer-input');
+  var sendBtn = document.getElementById('doc-composer-send');
+  var status = document.getElementById('doc-composer-status');
+  if (!input || !sendBtn) return;
+  function send(){
+    var text = input.value.trim();
+    if (text.length < 2) { input.focus(); return; }
+    sendBtn.disabled = true;
+    status.textContent = 'Sending\\u2026';
+    fetch('/__directives__', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: text})})
+      .then(function(r){ if (!r.ok) throw new Error(); return r.json(); })
+      .then(function(){
+        input.value = '';
+        status.textContent = 'Sent \\u2713 the AI will pick it up';
+        if (window.__spotlightFlash) window.__spotlightFlash('Sent to AI');
+        setTimeout(function(){ status.textContent = ''; }, 4000);
+      })
+      .catch(function(){ status.textContent = 'Could not send'; })
+      .finally(function(){ sendBtn.disabled = false; });
+  }
+  sendBtn.addEventListener('click', send);
+  input.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+})();
+</script>` : "";
+
   const sidebarHtml = tocHtml ? `  <nav class="sidebar">
     <div class="sidebar-header"><div class="doc-title">${escapeHtml(title)}</div></div>
     <div class="toc">
@@ -2120,6 +2274,7 @@ ${frontmatterHtml ? frontmatterHtml + "\n" : ""}${bodyHtml}
 ${reloadScript}
 ${scrollSpy}
 ${highlightScript}
+${composerScript}
 ${zoomScript}
 <div class="spotlight-brand" aria-label="spotlight-md version ${escapeHtml(VERSION)}">spotlight-md <span>v${escapeHtml(VERSION)}</span></div>
 </body>
@@ -2280,6 +2435,30 @@ function serveAuto(inputPath, opts, session) {
             "Content-Type": "application/json",
             Location: `/__highlights__/${hl.id}`,
           });
+          res.end(JSON.stringify(hl));
+          broadcastHighlights();
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+    // Whole-document directive: a message sent to the AI about the document as
+    // a whole (from the composer under the TOC), stored as a document-scoped
+    // highlight so it flows through the same agent loop and thread UI.
+    if (pathname === "/__directives__" && req.method === "POST") {
+      readBody(req).then((body) => {
+        try {
+          const data = JSON.parse(body);
+          const text = (data.text || "").trim();
+          if (text.length < 2) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "text required" }));
+            return;
+          }
+          const hl = addHighlight(session.id, { text, scope: "document", sectionTitle: "Whole document" });
+          res.writeHead(201, { "Content-Type": "application/json" });
           res.end(JSON.stringify(hl));
           broadcastHighlights();
         } catch (e) {
@@ -2515,6 +2694,15 @@ Choose a stable agent ID for this run, for example codex-session-abc123.
    This returns immediately if work is already unread, otherwise blocks until a
    highlight or a new human comment arrives. A highlight without a note is also
    work: inspect it and the document context.
+
+   Items come in two scopes (see each item's "scope" field):
+     - "text": a highlighted passage. The "text" field is the exact passage;
+       address it in place.
+     - "document": a whole-document message the human typed in the composer
+       (id starts with dm-), e.g. "add a joke to the end of each section". There
+       is no single passage — apply the instruction across the document, which
+       usually means several suggest-edit calls (one per location) all tied to
+       the directive's --highlight-id, plus one add-comment summarizing.
 
 2. Read the complete thread when needed:
 
