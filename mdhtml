@@ -2549,13 +2549,25 @@ Choose a stable agent ID for this run, for example codex-session-abc123.
        --replacement "the improved text" \\
        --comment "Acknowledged — here is a simpler phrasing." --agent-id codex-session-abc123 --json
 
-   The --anchor MUST appear verbatim in the markdown source (read the file to
-   copy it exactly, including punctuation). On approval the tool splices
-   replacement in place and the browser updates live; on dismissal nothing
-   changes. --comment optionally posts a note into the thread in the same call.
-   The suggestion appears the instant you run the command — the human does not
-   need to reload. Use add-comment (not suggest-edit) when the answer is a
-   discussion rather than a concrete text change.
+   For --anchor, the highlight's own text (the "text" field from
+   get-new-comments) is usually the best choice. Anchor matching tolerates
+   whitespace and line-wrapping differences, so text copied from the rendered
+   document still matches hard-wrapped markdown source — the words and
+   punctuation must match, but you do NOT need to reproduce the source's line
+   breaks. If the anchor can't be located, the approve fails with a clear error
+   and nothing changes.
+
+   To INSERT new content instead of replacing, put the anchor text at the start
+   of --replacement and append the new material after it. For example, to add a
+   section after a paragraph, anchor on that paragraph and make --replacement
+   the same paragraph followed by "\\n\\n## New section\\n\\n…".
+
+   On approval the tool splices replacement in place and the browser updates
+   live; on dismissal nothing changes. --comment optionally posts a note into
+   the thread in the same call. The suggestion appears the instant you run the
+   command — the human does not need to reload. Use add-comment (not
+   suggest-edit) when the answer is a discussion rather than a concrete text
+   change. Multiple highlights may be returned at once — address each one.
 
 5. Continue waiting. Do not complete a highlight merely because you replied.
    Complete it only when the human explicitly asks or the agreed workflow says
@@ -2584,146 +2596,6 @@ Use reopen-session only when the human deliberately resumes the review.
   process.exit(0);
 }
 
-if (opts.prime) {
-  console.log(`# spotlight-md — AI Agent Guide
-
-## What this tool does
-
-spotlight-md renders a markdown file as a dark-themed HTML page with
-live reload. A human reviewer reads the document in their browser and
-highlights passages that need attention. Each highlight becomes a
-conversation thread: the human leaves a note, you (the AI) respond with
-a comment and edit the markdown, the human replies with more feedback,
-and so on until the issue is resolved.
-
-Highlights are stored in a SQLite sidecar database (NOT in the markdown
-itself) so your edits to the markdown never conflict with the highlight
-annotations. Both the CLI and the web server can read/write
-concurrently thanks to WAL mode.
-
-## The review loop
-
-Each highlight is a conversation thread with messages from "human" and
-"ai" authors. The loop works like this:
-
-1. You edit the markdown document and save it.
-2. The browser auto-reloads. The human reads it and highlights passages.
-   They may attach a note to each highlight.
-3. You poll for highlights that need attention:
-     spotlight-md --needs-attention path/to/document.md
-   This lists highlights where the last message is from the human AND
-   the highlight is not resolved. These are the ones waiting for you.
-4. For each one: edit the markdown to address the issue, then add a
-   comment explaining what you changed:
-     spotlight-md --add-comment hl-abc123 --comment-text "Rewrote paragraph 3 with a concrete example" path/to/document.md
-5. The human sees your comment in the right panel. They can reply with
-   more feedback, resolve the highlight, or complete it.
-6. Repeat from step 3 until --needs-attention returns empty.
-
-You do NOT need to wait for the human to tell you to check. You can
-poll --needs-attention in a loop. If it returns nothing, there is no
-work to do. If it returns highlights, address them.
-
-## Commands
-
-### Poll for work (highlights needing your attention)
-
-  spotlight-md --needs-attention path/to/document.md
-
-Returns only highlights where:
-  - the last message is from the human (they are waiting for you)
-  - the highlight is not resolved or completed
-
-Output format:
-  Highlights for document.md (N total, X open, Y resolved, Z completed):
-
-  hl-abc123  §section-id
-    "preview of highlighted text..."
-    [YOU] First note from the human
-    [AI]  Your previous response (if any)
-    [YOU] Human's follow-up feedback
-    created: 2026-07-26T...
-
-### List all highlights (including resolved and completed)
-
-  spotlight-md --list-highlights path/to/document.md
-
-### Add an AI comment to a highlight (after addressing the issue)
-
-  spotlight-md --add-comment hl-abc123 --comment-text "What you changed and why" path/to/document.md
-
-Use comments to explain what you changed. The human sees them in the
-right panel with a blue border (distinct from their own messages which
-have an accent border). This closes the feedback loop.
-
-### Resolve a highlight (when you believe the issue is fully addressed)
-
-  spotlight-md --resolve-highlight hl-abc123 path/to/document.md
-
-Resolved highlights are dimmed in the panel and hidden by the default
-filter. The human can reopen them if they disagree.
-
-### Complete a highlight (marks it done, preserves history)
-
-  spotlight-md --delete-highlight hl-abc123 path/to/document.md
-
-Despite the flag name, this does NOT delete the highlight. It marks it
-completed and preserves the full conversation thread in the database.
-Use this only when the human explicitly asks you to clean up.
-
-### Mark all highlights as completed (only when the human asks)
-
-  spotlight-md --clear-highlights path/to/document.md
-
-### Serve a document for the human to review
-
-  spotlight-md --auto --theme dracula path/to/document.md
-
-This starts a local server (default port 7231) and opens the browser.
-The human can select text to create highlights (with optional notes),
-reply to highlights in the right panel, resolve them with a checkmark,
-or complete them. The server watches the file — when you save changes
-to the markdown, the browser reloads automatically.
-
-## Highlight data model
-
-Each highlight has:
-  - id:           short identifier (e.g. hl-abc123)
-  - text:         the exact passage the human highlighted
-  - sectionId:    HTML id of the nearest preceding heading
-  - sectionTitle: heading text for context
-  - resolved:     boolean — you or the human marked it resolved
-  - completed:    boolean — marked done (history preserved)
-  - messages:     array of {author: "human"|"ai", text, createdAt}
-  - createdAt:    ISO timestamp
-  - completedAt:  ISO timestamp (if completed)
-
-## Sidecar storage
-
-Highlights are stored in:  <filename>.md.highlights.db (SQLite, WAL mode)
-This file is managed by spotlight-md. Do not edit it by hand. Do not
-commit it to version control (add *.highlights.db to .gitignore).
-
-## Workflow rules
-
-- NEVER complete or delete highlights unless the human explicitly asks.
-  Highlights remain until the human decides they are done.
-- Poll --needs-attention to find work. If empty, there is nothing to do.
-- When you address a highlight, ALWAYS add a comment explaining what
-  you changed. The human relies on comments to verify your work without
-  reading the full diff.
-- After editing the markdown, save the file. The browser auto-reloads.
-- Pay attention to the full conversation thread — the human may have
-  replied to your earlier comment with new feedback.
-- The highlight text is the exact passage from the document at the time
-  the human selected it. Use it to locate the relevant section. If you
-  edit that passage, the highlight may no longer render in the browser
-  (the text changed) — that is expected and signals the issue was
-  addressed.
-- You can resolve a highlight when you believe it is fully addressed.
-  The human can reopen it if they disagree.`);
-  process.exit(0);
-}
 
 function requireSession() {
   if (!opts.sessionId) throw new Error("--session-id is required");
