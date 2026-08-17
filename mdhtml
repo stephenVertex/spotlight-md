@@ -1008,6 +1008,16 @@ mark.mdhtml-hl.ai-responded {
 mark.mdhtml-hl:hover {
   background: rgba(247,129,102,0.25);
 }
+/* Flash a passage when its panel card is clicked, so it's easy to locate. */
+mark.mdhtml-hl.hl-flash {
+  animation: hl-flash-pulse 1.3s ease-out;
+  border-radius: 3px;
+}
+@keyframes hl-flash-pulse {
+  0%   { background: var(--accent); color: #fff; box-shadow: 0 0 0 6px var(--accent-dim); }
+  15%  { background: var(--accent); color: #fff; box-shadow: 0 0 0 6px var(--accent-dim); }
+  100% { background: var(--accent-dim); color: inherit; box-shadow: 0 0 0 0 transparent; }
+}
 .hl-popup {
   position: fixed;
   z-index: 10000;
@@ -1548,6 +1558,23 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     content.normalize();
   }
 
+  // Jump to a highlight's passage in the document and flash it so the reviewer
+  // can immediately see where a panel card points.
+  function revealHighlight(id) {
+    var marks = content.querySelectorAll('mark.mdhtml-hl[data-hl-id="' + id + '"]');
+    if (!marks.length) {
+      if (window.__spotlightFlash) window.__spotlightFlash('That passage is no longer in the document');
+      return;
+    }
+    marks[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    marks.forEach(function(m){
+      m.classList.remove('hl-flash');
+      void m.offsetWidth; // restart the animation if it was mid-flash
+      m.classList.add('hl-flash');
+      (function(mk){ setTimeout(function(){ mk.classList.remove('hl-flash'); }, 1300); })(m);
+    });
+  }
+
   // -- Pending selection highlight: while the note popup is open, the browser
   //    clears the live text selection as soon as the note input takes focus.
   //    To keep the passage visible we wrap it in a temporary mark the instant
@@ -1700,14 +1727,12 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       var mark = content.querySelector('mark.mdhtml-hl[data-hl-id="' + id + '"]');
       var h = hls.find(function(x){return x.id === id});
 
-      // Click text to scroll to highlight
-      var textEl = card.querySelector('.hl-card-text');
-      if (textEl) {
-        textEl.addEventListener('click', function(e){
-          e.stopPropagation();
-          if (mark) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        });
-      }
+      // Click anywhere on the card (except its interactive controls) to jump to
+      // the passage in the document and flash it so it's easy to spot.
+      card.addEventListener('click', function(e){
+        if (e.target.closest('.hl-card-resolve-btn, .hl-add-reply, .hl-reply-box, .hl-reply-actions, .sugg-btn, .hl-suggestion')) return;
+        revealHighlight(id);
+      });
 
       // Resolve/unresolve button
       var resolveEl = card.querySelector('.hl-card-resolve-btn');
