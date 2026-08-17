@@ -1224,7 +1224,7 @@ mark.mdhtml-hl.has-suggestion::after {
 
 /* Floating popover anchored to the highlighted passage (no reflow) */
 .sugg-popover {
-  position: absolute;
+  position: fixed;
   z-index: 50;
   width: 320px;
   max-width: calc(100vw - 24px);
@@ -1713,14 +1713,8 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       + '</div>';
     document.body.appendChild(pop);
     var rect = mark.getBoundingClientRect();
-    var top = rect.top - pop.offsetHeight - 10;
-    if (top < 8) top = rect.bottom + 10; // flip below if no room above
-    var left = rect.left;
-    var maxLeft = window.innerWidth - pop.offsetWidth - 12;
-    if (left > maxLeft) left = maxLeft;
-    if (left < 8) left = 8;
-    pop.style.top = (top + window.scrollY) + 'px';
-    pop.style.left = (left + window.scrollX) + 'px';
+    // Fixed + zoom-aware: anchor just above the mark, flipping below if needed.
+    placeFixedPopup(pop, rect.left, rect.top, 'above');
     pop.querySelectorAll('.sugg-btn').forEach(function(btn){
       btn.addEventListener('click', function(e){
         e.stopPropagation();
@@ -1880,8 +1874,6 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     removeSelPopup();
     selPopup = document.createElement('div');
     selPopup.className = 'hl-popup';
-    selPopup.style.left = x + 'px';
-    selPopup.style.top = (y - 80) + 'px';
     selPopup.style.padding = '8px 10px';
     selPopup.style.flexDirection = 'column';
     selPopup.style.gap = '6px';
@@ -1922,7 +1914,31 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       if (e.key === 'Escape') { e.preventDefault(); removeSelPopup(); }
     });
     document.body.appendChild(selPopup);
+    // Position above the selection. Popups are fixed but scaled by the root
+    // zoom, so divide viewport coordinates by the zoom factor; use offsetHeight
+    // (local px) to sit the popup just above the passage.
+    placeFixedPopup(selPopup, x, y, 'above');
     setTimeout(function(){ noteInput.focus(); }, 50);
+  }
+
+  // Position a fixed popup so it renders at the given viewport (visual)
+  // coordinates regardless of the app zoom. place is 'above' or 'below' the
+  // anchor y.
+  function placeFixedPopup(el, xVisual, yVisual, place) {
+    var z = window.__spotlightZoom || 1;
+    var localLeft = xVisual / z;
+    var maxLeft = (window.innerWidth / z) - el.offsetWidth - 6;
+    if (localLeft > maxLeft) localLeft = maxLeft;
+    if (localLeft < 6) localLeft = 6;
+    var localTop;
+    if (place === 'below') {
+      localTop = (yVisual / z) + 10;
+    } else {
+      localTop = (yVisual / z) - el.offsetHeight - 10;
+      if (localTop < 6) localTop = (yVisual / z) + 10; // flip below if no room
+    }
+    el.style.left = localLeft + 'px';
+    el.style.top = localTop + 'px';
   }
 
   function createHighlightFromSelection(selection, note) {
@@ -1973,9 +1989,8 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
     });
     delPopup.appendChild(idSpan);
     delPopup.appendChild(completeBtn);
-    delPopup.style.left = x + 'px';
-    delPopup.style.top = (y + 20) + 'px';
     document.body.appendChild(delPopup);
+    placeFixedPopup(delPopup, x, y, 'below');
   }
 
   function completeHighlight(id) {
@@ -2044,7 +2059,7 @@ ${tocHtml}
   // so a hard refresh keeps your zoom. Intercepts Cmd/Ctrl +/-/0 so it is the
   // reliable zoom regardless of the browser's own per-origin zoom memory.
   const zoomScript = `<div class="zoom-control" aria-label="Zoom">
-  <div class="zoom-btn" id="zoom-out" title="Zoom out (Ctrl -)">\\u2212</div>
+  <div class="zoom-btn" id="zoom-out" title="Zoom out (Ctrl -)">&#8722;</div>
   <div class="zoom-level" id="zoom-level" title="Reset zoom (Ctrl 0)">100%</div>
   <div class="zoom-btn" id="zoom-in" title="Zoom in (Ctrl +)">+</div>
 </div>
@@ -2058,6 +2073,9 @@ ${tocHtml}
   function nearestIndex(v){ var bi=0,bd=Infinity; for(var i=0;i<STEPS.length;i++){var d=Math.abs(STEPS[i]-v); if(d<bd){bd=d;bi=i;}} return bi; }
   function apply(){
     document.documentElement.style.zoom = z;
+    // Expose the factor so fixed-position popups (which are scaled by the root
+    // zoom) can divide viewport coordinates by it and land on the selection.
+    window.__spotlightZoom = z;
     if (levelEl) levelEl.textContent = Math.round(z*100) + '%';
     try { localStorage.setItem(KEY, String(z)); } catch(e){}
   }
