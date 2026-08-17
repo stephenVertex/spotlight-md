@@ -1,8 +1,8 @@
 # spotlight-md
 
-Version: **0.4.0**
+Version: **0.5.0**
 
-Dark-themed markdown viewer with live reload, sidebar TOC, highlight annotations, live AI-suggested edits, whole-document AI messaging, and live "AI is working" indicators for AI-assisted document review.
+Dark-themed markdown viewer with live reload, LaTeX-style numbered sections, highlight annotations, live AI-suggested edits, whole-document AI messaging, and live "AI is working" indicators for AI-assisted document review.
 
 ## Install
 
@@ -62,7 +62,7 @@ Two built-in themes: **github-dark** (default) and **dracula**. Pass `--theme dr
 
 ### Sidebar TOC
 
-A sticky left sidebar lists all headings (h1-h3) with scroll-spy highlighting that tracks your position in the document. Click any heading to jump to it.
+A sticky left sidebar lists all headings (h1-h3) with scroll-spy highlighting that tracks your position in the document. Click any heading to jump to it. Sections are numbered LaTeX-style (each `##` is section N, each `###` is N.M) in both the document and the TOC, so you can refer to "section 2.1" — including in whole-document messages, where the agent receives the live numbered outline to resolve the reference.
 
 ### Frontmatter card
 

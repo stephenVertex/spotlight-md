@@ -422,6 +422,37 @@ function loadHighlightsWithSuggestions(sessionId) {
   return highlights.map((h) => ({ ...h, suggestions: byHl.get(h.id) || [], aiState: activity.get(h.id) || null }));
 }
 
+// LaTeX-style numbered outline of the document's ## / ### headings, derived
+// live from the current source. The UI numbers headings with CSS (display
+// only), so agents can't see the numbers in the source; this gives them the
+// exact mapping (e.g. "2.1" -> "Where to eat") to resolve human references.
+function numberedSectionOutline(docPath) {
+  let raw;
+  try { raw = readFileSync(docPath, "utf8"); }
+  catch (e) { return []; }
+  const lines = raw.split("\n");
+  const out = [];
+  let major = 0, minor = 0, inFence = false;
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    const m = line.match(/^(#{2,3})\s+(.*\S)\s*$/);
+    if (!m) continue;
+    const level = m[1].length;
+    const title = m[2].replace(/\s+#+\s*$/, "").trim();
+    if (level === 2) { major++; minor = 0; out.push({ number: String(major), level: 2, title }); }
+    else { minor++; out.push({ number: `${major}.${minor}`, level: 3, title }); }
+  }
+  return out;
+}
+
+// Attach a live section outline to whole-document directives so the agent can
+// resolve "section 2.1" style references without counting headings itself.
+function withCurrentToc(item, docPath) {
+  if (item && item.scope === "document") return { ...item, currentToc: numberedSectionOutline(docPath) };
+  return item;
+}
+
 function markRead(sessionId, id, agentId) {
   const db = openDb();
   try {
@@ -681,7 +712,13 @@ body {
 }
 .toc {
   padding: 0 8px;
+  counter-reset: toc-h2;
 }
+/* Match the document's LaTeX-style numbering in the table of contents. */
+.toc-l2 { counter-increment: toc-h2; counter-reset: toc-h3; }
+.toc-l3 { counter-increment: toc-h3; }
+.toc-l2 > span::before { content: counter(toc-h2) "\\00a0\\00a0"; color: var(--text-muted); }
+.toc-l3 > span::before { content: counter(toc-h2) "." counter(toc-h3) "\\00a0\\00a0"; color: var(--text-muted); }
 .toc-link {
   display: block;
   padding: 5px 12px;
@@ -770,6 +807,23 @@ h2 { font-size: 1.5em; padding-bottom: 0.3em; border-bottom: 1px solid var(--bor
 h3 { font-size: 1.25em; }
 h4 { font-size: 1em; }
 h5, h6 { font-size: 0.9em; color: var(--text-muted); }
+/* LaTeX-style section numbering (display only). Each ## is section N in order;
+   each ### is N.M. Numbers are CSS-generated and not written into the source. */
+.content { counter-reset: sec-h2; }
+.content h1 { counter-reset: sec-h2; }
+.content h2 { counter-reset: sec-h3; }
+.content h2::before {
+  counter-increment: sec-h2;
+  content: counter(sec-h2) "\\00a0\\00a0";
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.content h3::before {
+  counter-increment: sec-h3;
+  content: counter(sec-h2) "." counter(sec-h3) "\\00a0\\00a0";
+  color: var(--text-muted);
+  font-weight: 600;
+}
 p { margin-bottom: 1em; }
 a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -955,6 +1009,16 @@ tr:nth-child(even) td { background: var(--table-row-alt); }
 }
 .doc-composer-send:hover { filter: brightness(1.08); }
 .doc-composer-send:disabled { opacity: 0.6; cursor: default; }
+/* When the AI is working on a whole-document message, pulse the composer. */
+.doc-composer.ai-thinking {
+  border-color: var(--think);
+  animation: card-thinking-pulse 1.3s ease-in-out infinite;
+}
+.doc-composer.ai-thinking .doc-composer-label { color: var(--think); }
+.doc-composer.ai-thinking .doc-composer-label::after {
+  content: " \\00b7 working\\2026";
+  color: var(--think);
+}
 @media (max-width: 900px) { .doc-composer { display: none; } }
 /* Highlights */
 mark.mdhtml-hl {
@@ -993,7 +1057,14 @@ mark.mdhtml-hl.ai-responded {
 }
 /* Right-panel card echoes the same states so it's visible even when the
    highlighted passage is scrolled off-screen. */
-.hl-card.ai-thinking { border-color: var(--think); box-shadow: 0 0 0 1px color-mix(in srgb, var(--think) 40%, transparent); }
+.hl-card.ai-thinking {
+  border-color: var(--think);
+  animation: card-thinking-pulse 1.3s ease-in-out infinite;
+}
+@keyframes card-thinking-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--think) 32%, transparent); border-color: color-mix(in srgb, var(--think) 55%, var(--border)); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--think) 22%, transparent); border-color: var(--think); }
+}
 .hl-card-aistate {
   display: inline-flex; align-items: center; gap: 5px;
   margin-left: auto;
@@ -1953,6 +2024,13 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
       }
     });
     prevAiSig = newSig;
+    // A whole-document message has no passage to pulse, so surface the AI's
+    // "working" state on the composer itself.
+    var composer = document.getElementById('doc-composer');
+    if (composer) {
+      var docThinking = hls.some(function(h){ return h.scope === 'document' && h.aiState === 'thinking'; });
+      composer.classList.toggle('ai-thinking', docThinking);
+    }
   }
 
   // In-place document refresh: fetch freshly rendered fragments and patch the
@@ -2737,6 +2815,16 @@ Choose a stable agent ID for this run, for example codex-session-abc123.
        usually means several suggest-edit calls (one per location) all tied to
        the directive's --highlight-id, plus one add-comment summarizing.
 
+   Section numbers: the UI numbers headings LaTeX-style (each "## " heading is
+   section N in order — 1, 2, 3 … — and each "### " heading is N.M). These
+   numbers are display-only and are NOT in the markdown source, so when the
+   human refers to "section 2.1", use the "currentToc" field included on every
+   document item: it is the live numbered outline, e.g.
+     [{ "number": "2", "title": "Downtown", "level": 2 },
+      { "number": "2.1", "title": "Where to eat", "level": 3 }, … ]
+   Look up the referenced number to get the exact heading text, then edit under
+   that heading.
+
 2. Read the complete thread when needed:
 
      spotlight-md get-highlight-details --session-id sp-… --highlight-id hl-… --json
@@ -2858,10 +2946,11 @@ try {
       if (!opts.highlightId) throw new Error("--highlight-id is required");
       const highlight = loadHighlights(session.id).find((h) => h.id === opts.highlightId);
       if (!highlight) throw new Error(`highlight ${opts.highlightId} not found`);
-      emit(highlight);
+      emit(withCurrentToc(highlight, session.path));
     } else if (opts.command === "get-new-comments") {
       if (!opts.agentId) throw new Error("--agent-id is required");
-      emit(await waitForUpdates(session.id, opts.agentId));
+      const updates = await waitForUpdates(session.id, opts.agentId);
+      emit(updates.map((h) => withCurrentToc(h, session.path)));
     } else if (opts.command === "ai-agent-mark-read") {
       if (!opts.highlightId || !opts.agentId) throw new Error("--highlight-id and --agent-id are required");
       if (!markRead(session.id, opts.highlightId, opts.agentId)) throw new Error(`highlight ${opts.highlightId} not found`);

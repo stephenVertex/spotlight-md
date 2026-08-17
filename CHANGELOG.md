@@ -2,6 +2,13 @@
 
 All notable changes to spotlight-md follow [Semantic Versioning](https://semver.org/).
 
+## 0.5.0 — 2026-08-17
+
+- Added LaTeX-style section numbering (display only) to headings and the table of contents: each `##` is section N, each `###` is N.M, so passages are easy to refer to (e.g. "section 2.1").
+- Whole-document directives now carry a live `currentToc` field (the numbered outline) in the agent payload, so an agent can resolve "section 2.1" references without counting headings.
+- The "AI is working" state now pulses: a claimed highlight's panel card pulses, and a claimed whole-document message pulses the composer (with a "· working…" label), since it has no in-text passage to highlight.
+- Clicking a panel card scrolls to its passage and flashes it. Side columns now scroll independently under zoom.
+
 ## 0.4.0 — 2026-08-17
 
 - Added a whole-document composer in the bottom-left (below the TOC): type a message to the AI about the document as a whole (e.g. "add a joke to the end of each section"). It becomes a document-scoped item that flows through the same agent loop; the agent typically responds with one suggestion per location, each independently approvable inline. New `POST /__directives__` endpoint and `dm-`-prefixed document-scoped highlights.
