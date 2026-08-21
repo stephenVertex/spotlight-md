@@ -18,11 +18,11 @@ const VERSION = readFileSync(new URL("./VERSION", import.meta.url), "utf8").trim
 
 // ── CLI parsing ────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { auto: false, daemon: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, release: false, json: false, newSession: false };
+  const opts = { auto: false, daemon: false, port: 7231, output: null, open: true, theme: "github-dark", prime: false, files: [], command: null, sessionId: null, highlightId: null, agentId: null, comment: null, anchor: null, replacement: null, wait: false, waitTimeout: 290, release: false, json: false, newSession: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "prime") opts.prime = true;
-    else if (["status", "stop", "list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-claim", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
+    else if (["serve", "status", "stop", "list-highlights", "get-highlight-details", "get-new-comments", "ai-agent-mark-read", "add-comment", "suggest-edit", "list-suggestions", "ai-agent-claim", "ai-agent-mark-as-completed", "close-session", "reopen-session"].includes(a)) opts.command = a;
     else if (a === "--auto" || a === "-a") opts.auto = true;
     else if (a === "--daemon") opts.daemon = true;
     else if (a === "--port" || a === "-p") opts.port = parseInt(argv[++i], 10);
@@ -42,6 +42,8 @@ function parseArgs(argv) {
     else if (a === "--replacement") opts.replacement = argv[++i];
     else if (a.startsWith("--replacement=")) opts.replacement = a.slice(14);
     else if (a === "--wait") opts.wait = true;
+    else if (a === "--timeout") opts.waitTimeout = parseInt(argv[++i], 10);
+    else if (a.startsWith("--timeout=")) opts.waitTimeout = parseInt(a.slice(10), 10);
     else if (a === "--release") opts.release = true;
     else if (a === "--json") opts.json = true;
     else if (a === "--new-session") opts.newSession = true;
@@ -53,12 +55,13 @@ function parseArgs(argv) {
       console.log(`spotlight-md — Markdown review service
 
 Usage:
+  spotlight-md serve [--port NUM]     Run the review service in the foreground
   spotlight-md --auto [--json] [--new-session] FILE.md
   spotlight-md status [--port NUM] [--json]
   spotlight-md stop [--port NUM] [--json]
   spotlight-md list-highlights --session-id ID [--json]
   spotlight-md get-highlight-details --session-id ID --highlight-id ID [--json]
-  spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--json]
+  spotlight-md get-new-comments --session-id ID --agent-id ID [--wait] [--timeout SECONDS] [--json]
   spotlight-md ai-agent-mark-read --session-id ID --highlight-id ID --agent-id ID
   spotlight-md add-comment --session-id ID --highlight-id ID --comment TEXT [--agent-id ID]
   spotlight-md suggest-edit --session-id ID --highlight-id ID --anchor TEXT --replacement TEXT [--comment TEXT] [--agent-id ID]
@@ -70,6 +73,8 @@ Usage:
 
 Sessions and annotations live in ~/.config/spotlight-md/global-highlights-db.db.
 --auto resumes the document's active session unless --new-session is set.
+--wait long-polls for new work and returns an empty batch after --timeout
+seconds (default 290) so an agent's command never hangs past its harness limit.
 Use --json for stable machine-readable output.`);
       process.exit(0);
     } else if (a.startsWith("-")) {
@@ -2496,8 +2501,10 @@ function buildHtml(title, bodyHtml, frontmatterHtml, tocHtml, autoMode, themeNam
 
   // -- SSE: live updates. content-updated → patch the document in place;
   //    highlights-updated → re-fetch annotations (covers CLI-driven changes
-  //    like an AI agent adding comments or suggestions). --
-  try {
+  //    like an AI agent adding comments or suggestions). Skipped in embed mode
+  //    (?embed) so a headless snapshot renders once and settles. --
+  var embedMode = location.search.indexOf('embed') !== -1;
+  if (!embedMode) try {
     var es = new EventSource(apiBase + '/__reload__');
     es.addEventListener('content-updated', function(){ patchContent(); });
     es.addEventListener('highlights-updated', function(){ loadAndApply(); });
@@ -2604,7 +2611,7 @@ ${recentDocumentsHtml}${tocSectionHtml}
     if (e.shiftKey && document.activeElement === closeButton) { e.preventDefault(); dismissButton.focus(); }
     else if (!e.shiftKey && document.activeElement === dismissButton) { e.preventDefault(); closeButton.focus(); }
   });
-  if (!wasDismissed()) openGuide();
+  if (!wasDismissed() && location.search.indexOf('embed') === -1) openGuide();
 })();
 </script>` : "";
 
@@ -2769,6 +2776,88 @@ function readRequestBody(req, limit = 1024 * 1024) {
 function sendJson(res, status, value, extraHeaders = {}) {
   res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", ...extraHeaders });
   res.end(JSON.stringify(value));
+}
+
+function relativeTime(iso) {
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return "";
+  const s = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (s < 45) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  return `${d}d ago`;
+}
+
+// The root landing page: a list of documents currently registered with the
+// running service, most-recently-active first, each linking to its route.
+function renderRootIndex(docs, port, startedAt) {
+  const items = docs.length ? docs.map((d) => `      <li class="doc">
+        <a class="doc-link" href="${d.route}">
+          <span class="doc-title">${escapeHtml(d.title || basename(d.path))}</span>
+          <span class="doc-path">${escapeHtml(d.path)}</span>
+        </a>
+        <span class="doc-when">${escapeHtml(relativeTime(d.lastActivityAt))}</span>
+      </li>`).join("\n") : `      <li class="empty">No documents registered yet.<br>Register one with <code>spotlight-md --auto &lt;file.md&gt;</code>.</li>`;
+  const count = docs.length === 1 ? "1 document" : `${docs.length} documents`;
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>spotlight-md — recent documents</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9; --muted:#8b949e; --heading:#f0f6fc; --accent:#f78166; --link:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; padding:0 20px 80px; }
+  .wrap { max-width:820px; margin:0 auto; }
+  header { padding:56px 0 8px; }
+  h1 { color:var(--heading); font-size:1.7em; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13.5px; }
+  code { background:var(--panel); border:1px solid var(--border); border-radius:5px; padding:1px 6px; font-size:0.88em; color:var(--accent); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  ul { list-style:none; padding:0; margin:28px 0 0; }
+  li.doc { display:flex; align-items:baseline; gap:14px; padding:14px 16px; margin:8px 0; background:var(--panel); border:1px solid var(--border); border-radius:10px; transition:border-color .12s; }
+  li.doc:hover { border-color:var(--accent); }
+  .doc-link { flex:1; min-width:0; text-decoration:none; display:flex; flex-direction:column; gap:2px; }
+  .doc-title { color:var(--heading); font-size:1.05em; font-weight:600; }
+  .doc-path { color:var(--muted); font-size:12.5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .doc-when { color:var(--muted); font-size:12.5px; white-space:nowrap; flex-shrink:0; }
+  li.empty { color:var(--muted); padding:22px 16px; background:var(--panel); border:1px dashed var(--border); border-radius:10px; text-align:center; }
+  footer { margin-top:32px; color:var(--muted); font-size:12.5px; }
+  @media (prefers-color-scheme:light) { :root { --bg:#fff; --panel:#f6f8fa; --border:#d0d7de; --text:#1f2328; --muted:#636c76; --heading:#1f2328; --link:#0969da; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>spotlight-md</h1>
+    <p class="sub">Review service on <code>127.0.0.1:${port}</code> · ${count} · started ${escapeHtml(relativeTime(startedAt))}</p>
+  </header>
+  <ul>
+${items}
+  </ul>
+  <footer>This list refreshes automatically. Registering a document with <code>spotlight-md --auto</code> moves it to the top.</footer>
+</div>
+<script>
+  (function () {
+    var list = document.querySelector('ul');
+    var sub = document.querySelector('.sub');
+    setInterval(function () {
+      fetch(location.pathname, { cache: 'no-store' }).then(function (r) { return r.text(); }).then(function (html) {
+        var parsed = new DOMParser().parseFromString(html, 'text/html');
+        var freshList = parsed.querySelector('ul');
+        if (freshList && list && freshList.innerHTML !== list.innerHTML) list.innerHTML = freshList.innerHTML;
+        var freshSub = parsed.querySelector('.sub');
+        if (freshSub && sub && freshSub.innerHTML !== sub.innerHTML) sub.innerHTML = freshSub.innerHTML;
+      }).catch(function () {});
+    }, 5000);
+  })();
+</script>
+</body>
+</html>
+`;
 }
 
 function createDocumentState(inputPath, theme, session, onActivity) {
@@ -3092,6 +3181,15 @@ function serveDaemon(daemonOpts) {
         return;
       }
 
+      if ((pathname === "/" || pathname === "/index.html") && req.method === "GET") {
+        const docs = [...documentsByPath.values()]
+          .sort((left, right) => right.activitySequence - left.activitySequence)
+          .map((document) => ({ title: document.title, route: document.route, path: document.path, lastActivityAt: document.lastActivityAt }));
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+        res.end(renderRootIndex(docs, daemonOpts.port, startedAt));
+        return;
+      }
+
       let matchedDocument = documentsByRoute.get(pathname);
       let subpath = "";
       if (!matchedDocument) {
@@ -3265,6 +3363,33 @@ async function stopDaemon(port) {
   return daemonRequest(port, state, "/__spotlight__/stop", "POST");
 }
 
+// Run the review service in the foreground so it can be started and supervised
+// as a long-lived service (e.g. in a terminal or under launchd). Unlike --auto,
+// this does not register a document or spawn a detached child; it *is* the
+// daemon. Agents then reach an already-running service, so --auto returns
+// immediately instead of paying the spawn-and-wait cost.
+async function runServe(port) {
+  const probe = await probeDaemon(port);
+  if (probe === "running") {
+    const state = readDaemonState(port);
+    const info = state ? await daemonRequest(port, state, "/__spotlight__/status").catch(() => null) : null;
+    const docs = info && Array.isArray(info.documents) ? info.documents.length : 0;
+    console.error(`spotlight-md: a review service is already running on port ${port}` + (info ? ` (pid ${info.pid}, ${docs} document(s))` : "") + ".");
+    console.error(`Use 'spotlight-md status' to inspect it or 'spotlight-md stop' to stop it.`);
+    process.exit(1);
+  }
+  if (probe === "occupied") {
+    console.error(`spotlight-md: port ${port} is already used by another service.`);
+    process.exit(1);
+  }
+  removeStaleDaemonState(port);
+  console.log(`spotlight-md ${VERSION} — review service listening on http://127.0.0.1:${port}`);
+  console.log(`Register documents from another terminal:  spotlight-md --auto --no-open <file.md>`);
+  console.log(`Inspect: spotlight-md status   Stop: spotlight-md stop (or Ctrl-C here).`);
+  serveDaemon({ port });
+  await new Promise(() => {});
+}
+
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 const opts = parseArgs(process.argv.slice(2));
@@ -3308,9 +3433,17 @@ Choose a stable agent ID for this run, for example codex-session-abc123.
 
      spotlight-md get-new-comments --session-id sp-… --agent-id codex-session-abc123 --wait --json
 
-   This returns immediately if work is already unread, otherwise blocks until a
-   highlight or a new human comment arrives. A highlight without a note is also
-   work: inspect it and the document context.
+   This returns immediately if work is already unread, otherwise long-polls for a
+   highlight or a new human comment. The wait is bounded: it returns an EMPTY
+   array after --timeout seconds (default 290) so the call never hangs past your
+   own command timeout. An empty result means "nothing yet" — just call it again
+   to keep waiting. If your harness kills commands sooner, pass a smaller ceiling,
+   e.g. --wait --timeout 50, and loop. A highlight without a note is also work:
+   inspect it and the document context.
+
+   The service is usually already running (the human starts it with
+   'spotlight-md serve', or the first --auto starts it). You do not manage its
+   lifecycle; you only talk to it with the session-scoped commands below.
 
    Items come in two scopes (see each item's "scope" field):
      - "text": a highlighted passage. The "text" field is the exact passage;
@@ -3435,16 +3568,23 @@ function getUnreadSafe(sessionId, agentId) {
 async function waitForUpdates(sessionId, agentId) {
   let updates = getUnreadSafe(sessionId, agentId);
   if ((updates && updates.length) || !opts.wait) return updates || [];
+  // Bound the long-poll so the call can't hang past the caller's harness
+  // timeout. A ceiling <= 0 means block indefinitely (legacy behavior).
+  const ceilingMs = Number.isFinite(opts.waitTimeout) && opts.waitTimeout > 0 ? opts.waitTimeout * 1000 : 0;
   return new Promise((resolveWait) => {
     const timer = setInterval(() => {
       const u = getUnreadSafe(sessionId, agentId);
-      if (u && u.length) { clearInterval(timer); resolveWait(u); }
+      if (u && u.length) { clearInterval(timer); if (deadline) clearTimeout(deadline); resolveWait(u); }
     }, 250);
+    const deadline = ceilingMs ? setTimeout(() => { clearInterval(timer); resolveWait([]); }, ceilingMs) : null;
   });
 }
 
 try {
   if (opts.command) {
+    if (opts.command === "serve") {
+      await runServe(opts.port);
+    }
     if (opts.command === "status") {
       const current = await daemonStatus(opts.port);
       emit(current);

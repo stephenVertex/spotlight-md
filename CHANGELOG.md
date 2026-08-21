@@ -2,6 +2,12 @@
 
 All notable changes to spotlight-md follow [Semantic Versioning](https://semver.org/).
 
+## 0.6.2 — 2026-08-17
+
+- The service root (`http://127.0.0.1:PORT/`) now renders a landing page listing every registered document, most-recently-active first, each with its title, path, and relative activity time, linking to its review route. The list patches itself in place every few seconds (no full reload) as documents are registered or touched.
+- Added a foreground `serve` command so the review service can be started and supervised as a long-lived service (a terminal, `launchd`, etc.) instead of only being spawned on demand by `--auto`. It refuses to start if a service is already on the port, and `status`/`stop` manage it as usual. When a service is already running, `--auto` reaches it immediately instead of paying the spawn-and-wait cost.
+- Bounded the agent long-poll: `get-new-comments --wait` now returns an empty batch after `--timeout` seconds (default 290) instead of blocking forever, so an agent's command can't hang past its harness timeout. Agents loop on the empty result; pass a smaller `--timeout` to stay under a shorter command limit. `prime` documents the loop.
+
 ## 0.6.1 — 2026-08-17
 
 - Merged the two development lines into one build: the persistent multi-document daemon (virtual routes, `status`/`stop`, recent-documents sidebar, first-run guide) now serves the full review toolkit (suggested edits, whole-document composer, AI-working pulses, zoom, LaTeX section numbering, `currentToc`). Each registered document gets its own review session, live-reload channel, and highlight/suggestion state.

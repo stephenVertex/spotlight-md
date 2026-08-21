@@ -1,6 +1,6 @@
 # spotlight-md
 
-Version: **0.6.1**
+Version: **0.6.2**
 
 Dark-themed markdown viewer with live reload, LaTeX-style numbered sections, highlight annotations, live AI-suggested edits, whole-document AI messaging, and live "AI is working" indicators for AI-assisted document review.
 
@@ -14,7 +14,11 @@ Releases follow [Semantic Versioning](https://semver.org/); see [CHANGELOG.md](C
 ## Quick start
 
 ```bash
+# Optional: start the review service in the foreground and leave it running
+spotlight-md serve
+
 # Register a Markdown file with the persistent local review server
+# (also starts the service automatically if it isn't already running)
 spotlight-md --auto --json --theme dracula path/to/document.md
 
 # Inspect or stop the server
@@ -29,6 +33,7 @@ spotlight-md -o output.html path/to/document.md
 
 ```
 spotlight-md file.md                Write file.html
+spotlight-md serve [--port 4040]    Run the review service in the foreground
 spotlight-md --auto file.md         Register, watch, and open in browser
 spotlight-md -o out.html file.md    Specify output path
 spotlight-md --port 4040 --auto file.md
@@ -37,7 +42,7 @@ spotlight-md status [--port 4040]   Show server and registered documents
 spotlight-md stop [--port 4040]     Stop the persistent server
 
 spotlight-md list-highlights --session-id sp-… --json
-spotlight-md get-new-comments --session-id sp-… --agent-id codex-… --wait --json
+spotlight-md get-new-comments --session-id sp-… --agent-id codex-… --wait [--timeout 290] --json
 spotlight-md add-comment --session-id sp-… --highlight-id hl-… --agent-id codex-… --comment "Addressed it"
 spotlight-md suggest-edit --session-id sp-… --highlight-id hl-… --anchor "old text" --replacement "new text" --comment "Rephrased"
 spotlight-md list-suggestions --session-id sp-… --json
@@ -82,7 +87,7 @@ In `--auto` mode, one persistent daemon watches every registered Markdown file. 
 
 ### Persistent server and virtual routes
 
-`--auto` starts the daemon on `127.0.0.1:7231` when needed, reuses it on later invocations, registers the canonical document path, opens that document’s URL, and then exits. Each document gets an encoded virtual route such as `/spotlight/Users/example/project/review.html`; spaces, Unicode, `%`, `#`, and other special characters are safely percent-encoded. A registered document keeps its own review session, live-reload channel, and highlight/suggestion state.
+Run `spotlight-md serve` to start the daemon in the foreground and leave it running as a long-lived service (in a terminal, under `launchd`, etc.); it refuses to start a second copy on the same port, and `status`/`stop` manage it. You don't have to: `--auto` starts the daemon on `127.0.0.1:7231` when needed, reuses it on later invocations, registers the canonical document path, opens that document’s URL, and then exits. Starting the service yourself just means every `--auto` finds it already running and returns instantly. Each document gets an encoded virtual route such as `/spotlight/Users/example/project/review.html`; spaces, Unicode, `%`, `#`, and other special characters are safely percent-encoded. A registered document keeps its own review session, live-reload channel, and highlight/suggestion state.
 
 Virtual routes are registry lookups, not filesystem path resolvers. A URL can read only a file previously registered by a local `--auto` invocation. Daemon registration and shutdown also require a random control token kept in the user-only configuration directory. Use `spotlight-md status` to see the daemon PID and registered documents, and `spotlight-md stop` to stop it cleanly. Pass the same `--port` to lifecycle commands when using a non-default port.
 
